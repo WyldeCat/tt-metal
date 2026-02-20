@@ -179,8 +179,8 @@ static Op2DSliceConfig determine_slice_config_internal(
         return_slice_config.slice_type = slice_config_.value().slice_type;
     }
 
-    log_warning(tt::LogOp, "DRAM Auto slice with {} free memory", L1_stats.total_free_bytes);
-    log_warning(
+    log_info(tt::LogOp, "DRAM Auto slice with {} free memory", L1_stats.total_free_bytes);
+    log_info(
         tt::LogOp,
         "Determining slice config: output_layout={}, output_height={}, output_width={}, auto_slice_type={}",
         output_layout == tt::tt_metal::Layout::TILE ? "TILE" : "ROW_MAJOR",
@@ -196,7 +196,7 @@ static Op2DSliceConfig determine_slice_config_internal(
 
     const uint32_t max_num_slices = compute_max_num_slices(output_sliced_dim, slice_rounding_value, output_layout);
 
-    log_warning(
+    log_info(
         tt::LogOp,
         "Max possible slices for {} layout and {}-slicing: {} (output_sliced_dim={})",
         output_layout == tt::tt_metal::Layout::TILE ? "TILE" : "ROW_MAJOR",
@@ -209,7 +209,7 @@ static Op2DSliceConfig determine_slice_config_internal(
         return_slice_config.num_slices = current_num_slices;
         uint32_t l1_usage = compute_L1_usage_for_slice_config(
             input_shape, output_shape, output_layout, op_slice_attr, return_slice_config);
-        log_warning(
+        log_debug(
             tt::LogOp,
             "Trying num_slices={}: L1 usage={}, available={}",
             current_num_slices,
@@ -217,7 +217,7 @@ static Op2DSliceConfig determine_slice_config_internal(
             L1_stats.total_free_bytes);
         if (L1_stats.total_free_bytes >= l1_usage) {
             found_valid_config = true;
-            log_warning(tt::LogOp, "Found valid config with num_slices={}, L1 usage={}", current_num_slices, l1_usage);
+            log_info(tt::LogOp, "Found valid config with num_slices={}, L1 usage={}", current_num_slices, l1_usage);
             break;
         }
         current_num_slices++;
@@ -293,7 +293,7 @@ void run_sliced_op(
         output_tensors[0].get().logical_shape().to_array_4D();
     auto [in_batch_, input_height, input_width, input_channels] = input_tensor.logical_shape().to_array_4D();
 
-    log_warning(
+    log_info(
         tt::LogOp,
         "run_sliced_op called: output_layout={}, output_shape={}x{}, dram_slice_config_.has_value()={}",
         output_layout == tt::tt_metal::Layout::TILE ? "TILE" : "ROW_MAJOR",
@@ -303,9 +303,9 @@ void run_sliced_op(
 
     if (dram_slice_config_.has_value() && dram_slice_config_.value().num_slices > 0) {
         dram_slice_config = dram_slice_config_.value();
-        log_warning(tt::LogOp, "Using provided slice config: num_slices={}", dram_slice_config.num_slices);
+        log_info(tt::LogOp, "Using provided slice config: num_slices={}", dram_slice_config.num_slices);
     } else {
-        log_warning(tt::LogOp, "Calling determine_slice_config to auto-determine configuration");
+        log_info(tt::LogOp, "Calling determine_slice_config to auto-determine configuration");
         dram_slice_config = determine_slice_config(
             op_slice_attr,
             input_tensor.logical_shape(),
