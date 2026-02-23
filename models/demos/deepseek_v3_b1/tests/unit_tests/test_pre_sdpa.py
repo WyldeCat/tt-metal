@@ -271,12 +271,17 @@ def test_pre_sdpa(
     torch_matmul3_weights = torch.randn((num_tp * NUM_QNOPE_HEADS, QNOPE_HEAD_DIM, QNOPE_OUT_DIM), dtype=torch.bfloat16)
 
     # kv_b2_proj weights (placeholder — not consumed by pre-SDPA but required by the fused buffer)
-    torch_kv_b2_proj_weights = torch.randn(
+    torch_kv_b2_proj_weights = torch.zeros(
         (QNOPE_OUT_DIM, num_tp * NUM_QNOPE_HEADS * QNOPE_HEAD_DIM), dtype=torch.bfloat16
     )
 
     # DKV matmul weights (raw, unshuffled — BlitzDecodeWeights handles shard reordering)
     torch_dkv_matmul_weights = torch.randn(dkv_matmul_weights_shape, dtype=torch.bfloat16)
+
+    # Placeholder tensors for get_tt_o_proj_and_gate_mm_weights (not consumed by pre-SDPA)
+    torch_o_proj_weights = torch.zeros((num_tp * 8192, 7168), dtype=torch.bfloat16)
+    torch_gate_mm_weights = torch.zeros((7168, 256), dtype=torch.bfloat16)
+    torch_ffn_norm = torch.zeros((1, 7168), dtype=torch.bfloat16)
 
     # ========================================================================
     # Create RoPE tensors (sin, cos, trans_mat)
@@ -349,16 +354,6 @@ def test_pre_sdpa(
         mesh_mapper=ttnn.ShardTensorToMesh(submesh, dim=0),
     )
 
-    ttnn_gamma = ttnn.from_torch(
-        torch_gamma,
-        dtype=ttnn.bfloat16,
-        layout=ttnn.TILE_LAYOUT,
-        device=submesh,
-        memory_config=mem_config,
-        tile=tile,
-        mesh_mapper=ttnn.ReplicateTensorToMesh(submesh),
-    )
-
     # Fused matmul1 (q_a_proj packed), matmul2 (q_b_proj shuffled), and DKV matmul (kv_a_proj)
     # weights as overlapped tensors sharing a single L1 buffer via BlitzDecodeWeights.
     bdw = BlitzDecodeWeights(submesh)
@@ -370,25 +365,6 @@ def test_pre_sdpa(
         torch_matmul_weights,
         torch_matmul2_weights_full_unshuffled,
         torch_dkv_matmul_weights,
-    )
-
-    # RMSNorm2 gamma tensor
-    rmsnorm2_gamma_shard_spec = ttnn.ShardSpec(
-        ttnn.CoreRangeSet({ttnn.CoreRange(mcast_core, mcast_core)}),
-        (1, rmsnorm2_width),
-        ttnn.ShardOrientation.ROW_MAJOR,
-    )
-    rmsnorm2_gamma_mem_config = ttnn.MemoryConfig(
-        ttnn.TensorMemoryLayout.HEIGHT_SHARDED, ttnn.BufferType.L1, rmsnorm2_gamma_shard_spec
-    )
-    ttnn_rmsnorm2_gamma = ttnn.from_torch(
-        torch_rmsnorm2_gamma,
-        dtype=ttnn.bfloat16,
-        layout=ttnn.TILE_LAYOUT,
-        device=submesh,
-        memory_config=rmsnorm2_gamma_mem_config,
-        tile=tile,
-        mesh_mapper=ttnn.ReplicateTensorToMesh(submesh),
     )
 
     # Matmul3 / kv_b1_proj weights — fused with kv_b2_proj via BlitzDecodeWeights
@@ -492,25 +468,24 @@ def test_pre_sdpa(
         mesh_mapper=ttnn.ReplicateTensorToMesh(submesh),
     )
 
-    # KV Cache Branch
+    # KV Cache Branch RMSNorm gamma
     torch_dkv_rmsnorm_gamma = torch.randn((1, KNOPE_DIM), dtype=torch.bfloat16)
-    dkv_rmsnorm_gamma_shard_spec = ttnn.ShardSpec(
-        kv_cache_branch_rms_crs,
-        (1, KNOPE_DIM),
-        ttnn.ShardOrientation.ROW_MAJOR,
-    )
-    dkv_rmsnorm_gamma_mem_config = ttnn.MemoryConfig(
-        ttnn.TensorMemoryLayout.HEIGHT_SHARDED, ttnn.BufferType.L1, dkv_rmsnorm_gamma_shard_spec
-    )
 
-    ttnn_dkv_rmsnorm_gamma = ttnn.from_torch(
+    # Fused o_proj, gate_mm, and RMSNorm gammas — we only need the 3 gamma overlapped views.
+    (
+        _,  # o_proj
+        _,  # gate_mm
+        gamma_overlapped,
+        rmsnorm2_gamma_overlapped,
+        dkv_rmsnorm_gamma_overlapped,
+        _,  # ffn_norm
+    ) = bdw.get_tt_o_proj_and_gate_mm_weights(
+        torch_o_proj_weights,
+        torch_gate_mm_weights,
+        torch_gamma,
+        torch_rmsnorm2_gamma,
         torch_dkv_rmsnorm_gamma,
-        dtype=ttnn.bfloat16,
-        layout=ttnn.TILE_LAYOUT,
-        device=submesh,
-        memory_config=dkv_rmsnorm_gamma_mem_config,
-        tile=tile,
-        mesh_mapper=ttnn.ReplicateTensorToMesh(submesh),
+        torch_ffn_norm,
     )
 
     # KRoPE cos/sin: DRAM INTERLEAVED (each krope core reads its width slice)
@@ -616,9 +591,9 @@ def test_pre_sdpa(
         ttnn_output_result = PreSDPA.op(
             input_tensor_mesh,
             intermediate_tensor_mesh,
-            ttnn_gamma,
+            gamma_overlapped,
             matmul_weights_overlapped,
-            ttnn_rmsnorm2_gamma,
+            rmsnorm2_gamma_overlapped,
             matmul2_weights_overlapped,
             matmul3_weights_overlapped,
             ttnn_qrope_sin,
@@ -627,7 +602,7 @@ def test_pre_sdpa(
             ttnn_krope_cos,
             ttnn_krope_sin,
             dkv_matmul_weights_overlapped,
-            ttnn_dkv_rmsnorm_gamma,
+            dkv_rmsnorm_gamma_overlapped,
             ttnn_kv_cache,
             position_id,
             ttnn_position_ids,
