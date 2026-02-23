@@ -293,7 +293,7 @@ def test_convt2d_dram(
         and layout == ttnn.ROW_MAJOR_LAYOUT
         and preprocess_weights
     ):
-        pytest.skip("These cases fail all close checks")
+        pytest.skip("These cases fail all close checks see #38257")
     dram_slice_config = ttnn.Conv2dSliceConfig(
         slice_type=slice_type,
         num_slices=0 if auto_slice else num_slices,
