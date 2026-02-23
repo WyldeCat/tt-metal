@@ -270,6 +270,11 @@ def test_pre_sdpa(
     # Each TP slice of 64 heads is height-sharded on 64 cores per device.
     torch_matmul3_weights = torch.randn((num_tp * NUM_QNOPE_HEADS, QNOPE_HEAD_DIM, QNOPE_OUT_DIM), dtype=torch.bfloat16)
 
+    # kv_b2_proj weights (placeholder — not consumed by pre-SDPA but required by the fused buffer)
+    torch_kv_b2_proj_weights = torch.randn(
+        (QNOPE_OUT_DIM, num_tp * NUM_QNOPE_HEADS * QNOPE_HEAD_DIM), dtype=torch.bfloat16
+    )
+
     # DKV matmul weights (raw, unshuffled — BlitzDecodeWeights handles shard reordering)
     torch_dkv_matmul_weights = torch.randn(dkv_matmul_weights_shape, dtype=torch.bfloat16)
 
@@ -386,29 +391,11 @@ def test_pre_sdpa(
         mesh_mapper=ttnn.ReplicateTensorToMesh(submesh),
     )
 
-    # Matmul3 weights tensor - height sharded on Qnope grid (64 cores)
-    # Each core gets [128, 512] = shape per core
-    qnope_grid = ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(QNOPE_GRID_COLS - 1, matmul2_grid_y - 1))
-    # Flatten matmul3 weights for height sharding: [num_tp * num_heads * K, N] = [num_tp * 8192, 512]
-    # Each TP slice of 64 heads ([8192, 512]) is height-sharded on 64 cores per device.
+    # Matmul3 / kv_b1_proj weights — fused with kv_b2_proj via BlitzDecodeWeights
     torch_matmul3_weights_flat = torch_matmul3_weights.reshape(num_tp * NUM_QNOPE_HEADS * QNOPE_HEAD_DIM, QNOPE_OUT_DIM)
-    matmul3_shard_shape = (QNOPE_HEAD_DIM, QNOPE_OUT_DIM)  # [128, 512] per core
-    matmul3_shard_spec = ttnn.ShardSpec(
-        ttnn.CoreRangeSet({qnope_grid}),
-        matmul3_shard_shape,
-        ttnn.ShardOrientation.ROW_MAJOR,
-    )
-    matmul3_mem_config = ttnn.MemoryConfig(
-        ttnn.TensorMemoryLayout.HEIGHT_SHARDED, ttnn.BufferType.L1, matmul3_shard_spec
-    )
-
-    ttnn_matmul3_weights = ttnn.from_torch(
+    matmul3_weights_overlapped, _ = bdw.get_tt_kv_b12_proj_weights(
         torch_matmul3_weights_flat,
-        dtype=ttnn.bfloat8_b,
-        layout=ttnn.TILE_LAYOUT,
-        device=submesh,
-        memory_config=matmul3_mem_config,
-        mesh_mapper=ttnn.ShardTensor2dMesh(submesh, mesh_shape=(mesh_rows, mesh_cols), dims=(None, 0)),
+        torch_kv_b2_proj_weights,
     )
 
     # SDPA input tensor - height sharded on SDPA input grid (cols 0-3, rows 1-2)
@@ -633,7 +620,7 @@ def test_pre_sdpa(
             matmul_weights_overlapped,
             ttnn_rmsnorm2_gamma,
             matmul2_weights_overlapped,
-            ttnn_matmul3_weights,
+            matmul3_weights_overlapped,
             ttnn_qrope_sin,
             ttnn_qrope_cos,
             ttnn_trans_mat,
