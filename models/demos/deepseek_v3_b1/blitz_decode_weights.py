@@ -398,15 +398,26 @@ class KVB12_PROJ_SingleDeviceOverlapSpec:
     # --- weight shuffles ------------------------------------------------------
 
     def shuffle_kv_b2(self, weights: torch.Tensor) -> torch.Tensor:
-        """Reshape (512, 8192) into (8192, 512) for HEIGHT_SHARDED placement.
+        """Tile-level rearrange (512, 8192) into (8192, 512) for HEIGHT_SHARDED.
 
-        Each (128, 512) shard in the result corresponds to one (512, 128)
-        column slice of the input.
+        Each core's (512, 128) column slice is a 16×4 grid of 32×32 tiles.
+        These 64 tiles are laid out contiguously into a (128, 512) shard
+        (4×16 tile grid), preserving per-tile element data so that
+        ``from_torch`` with TILE_LAYOUT produces byte-identical BFP8 tiles.
         """
         kv_dim, n_heads = self.kv_b2_proj_shape
         n_cores = self.kv_b2_core_range_set.num_cores()
         head_dim = n_heads // n_cores
-        return weights.reshape(kv_dim, n_cores, head_dim).permute(1, 2, 0).reshape(-1, kv_dim).contiguous()
+        t = self.tile_h
+
+        k_tiles = kv_dim // t
+        n_tiles = head_dim // t
+
+        per_core = weights.reshape(kv_dim, n_cores, head_dim).permute(1, 0, 2).contiguous()
+        tiles = per_core.reshape(n_cores, k_tiles, t, n_tiles, t)
+        tiles = tiles.permute(0, 1, 3, 2, 4).reshape(n_cores, k_tiles * n_tiles, t, t)
+        tiles = tiles.reshape(n_cores, head_dim // t, kv_dim // t, t, t)
+        return tiles.permute(0, 1, 3, 2, 4).reshape(n_cores * head_dim, kv_dim).contiguous()
 
 
 KVB12_PROJ_SINGLE_DEVICE_OVERLAP_SPEC = KVB12_PROJ_SingleDeviceOverlapSpec()
@@ -1050,6 +1061,7 @@ class BlitzDecodeWeights:
 
             -- kv_b2 region: 64 remaining cores (5x8 + 12x2) --
             kv_b2_proj (512, 8192) as bfloat8_b, shard (512, 128)
+            tile-shuffled into (128, 512) shape
 
             combined: 128 cores, HEIGHT_SHARDED, shard (128, 512)
 

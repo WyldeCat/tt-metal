@@ -44,6 +44,7 @@ from models.demos.deepseek_v3_b1.unified_kernel_descriptor import (
     UnifiedCompileTimeCoreDescriptor,
     UnifiedKernelDescriptor,
 )
+from models.demos.deepseek_v3_b1.utils import cb_descriptor_from_overlapped_tensor
 
 
 def _round_up(value: int, alignment: int) -> int:
@@ -131,8 +132,8 @@ class PostSDPA:
         Args:
             input_tensor_mesh: Input tensor mesh [1, 512] (height-sharded across 8x8 matmul1 cores)
                                When sdpa_enabled, this receives scatter output from SDPA phase
-            weights1_tensor: First weights tensor [512, 8192] (width-sharded across 8x8)
-            weights2_tensor: Second weights tensor [8192, 7168] (width-sharded across 112 cores)
+            weights1_tensor: OverlappedTensor for kv_b2_proj [512, 8192] (fused kv_b12 buffer, 64 cores)
+            weights2_tensor: OverlappedTensor for o_proj [8192, 7168] (fused o_proj/gate/gamma buffer, 112 cores)
             gather1_output_tensor: Intermediate tensor [1, 8192] for gather1/mcast (on gather core)
             gather2_output_tensor: Intermediate tensor mesh [1, 7168] for gather2/CCL (on gather core per device)
             intermediate_tensor: CCL intermediate tensor mesh for receiving remote data (None when ccl_enabled=False)
@@ -174,6 +175,8 @@ class PostSDPA:
 
         # Get per-device tensors
         input_tensors_per_device = ttnn.get_device_tensors(input_tensor_mesh)
+        weights1_fused_tensors_per_device = ttnn.get_device_tensors(weights1_tensor.fused_tensor)
+        weights2_fused_tensors_per_device = ttnn.get_device_tensors(weights2_tensor.fused_tensor)
         gather2_output_tensors_per_device = ttnn.get_device_tensors(gather2_output_tensor)
         if ccl_enabled:
             intermediate_tensors_per_device = ttnn.get_device_tensors(intermediate_tensor)
@@ -210,19 +213,16 @@ class PostSDPA:
             standard_tile_size_bytes = intermediate_tile_height * intermediate_tile_width * element_size
 
         # ========================================================================
-        # Core grid configuration (same for all devices)
+        # Core grid configuration — derived from weight OverlappedTensors
         # ========================================================================
-        # Matmul1 grid: 8x8 = 64 cores
-        MATMUL1_GRID_START_X = 0
-        MATMUL1_GRID_START_Y = 0
-        MATMUL1_GRID_END_X = 7  # 8 columns (0-7)
-        MATMUL1_GRID_END_Y = 7  # 8 rows (0-7)
-        matmul1_grid = ttnn.CoreRange(
-            ttnn.CoreCoord(MATMUL1_GRID_START_X, MATMUL1_GRID_START_Y),
-            ttnn.CoreCoord(MATMUL1_GRID_END_X, MATMUL1_GRID_END_Y),
-        )
-        matmul1_core_grid = ttnn.CoreRangeSet([matmul1_grid])
-        num_matmul1_cores = matmul1_grid.grid_size().x * matmul1_grid.grid_size().y  # 64
+        # Matmul1 grid: from kv_b2 overlapped tensor (64 cores)
+        matmul1_core_grid = weights1_tensor.core_range_set
+        num_matmul1_cores = matmul1_core_grid.num_cores()  # 64
+        matmul1_bbox = matmul1_core_grid.bounding_box()
+        MATMUL1_GRID_START_X = matmul1_bbox.start.x
+        MATMUL1_GRID_START_Y = matmul1_bbox.start.y
+        MATMUL1_GRID_END_X = matmul1_bbox.end.x
+        MATMUL1_GRID_END_Y = matmul1_bbox.end.y
 
         # Gather/CCL receiver core: (12, 9)
         gather_core = ttnn.CoreCoord(12, 9)
@@ -244,23 +244,16 @@ class PostSDPA:
         mcast_core_grid = ttnn.CoreRangeSet([mcast_grid])
         num_mcast_cores = mcast_grid.grid_size().x * mcast_grid.grid_size().y  # 130
 
-        # Active Matmul2 cores: 112 cores (rows 0-8 full 12 cols + row 9 cols 0-3)
-        matmul2_grid_main = ttnn.CoreRange(
-            ttnn.CoreCoord(0, 0),
-            ttnn.CoreCoord(11, 8),  # 12 columns x 9 rows = 108 cores
-        )
-        matmul2_grid_extra = ttnn.CoreRange(
-            ttnn.CoreCoord(0, 9),
-            ttnn.CoreCoord(3, 9),  # 4 columns x 1 row = 4 cores
-        )
-        matmul2_active_core_grid = ttnn.CoreRangeSet([matmul2_grid_main, matmul2_grid_extra])
-        num_matmul2_cores = 112  # 108 + 4 active cores
+        # Active Matmul2 cores: from o_proj overlapped tensor (112 cores)
+        matmul2_active_core_grid = weights2_tensor.core_range_set
+        num_matmul2_cores = matmul2_active_core_grid.num_cores()  # 112
 
-        # Gather2 sender grid bounds (for offset calculation, use bounding box)
-        MATMUL2_GRID_START_X = 0
-        MATMUL2_GRID_START_Y = 0
-        MATMUL2_GRID_END_X = 11  # Same as mcast grid for offset calculation
-        MATMUL2_GRID_END_Y = 9
+        # Gather2 sender grid bounds (bounding box of matmul2 active grid)
+        matmul2_bbox = matmul2_active_core_grid.bounding_box()
+        MATMUL2_GRID_START_X = matmul2_bbox.start.x
+        MATMUL2_GRID_START_Y = matmul2_bbox.start.y
+        MATMUL2_GRID_END_X = matmul2_bbox.end.x
+        MATMUL2_GRID_END_Y = matmul2_bbox.end.y
 
         # Full grid (union of all cores for semaphore allocation)
         full_grid = matmul1_core_grid.merge(gather_core_grid).merge(mcast_core_grid).merge(ccl_sender_core_grid)
@@ -492,6 +485,8 @@ class PostSDPA:
 
                 # Get the device's tensors
                 input_tensor_device = input_tensors_per_device[device_idx]
+                weights1_fused_tensor_device = weights1_fused_tensors_per_device[device_idx]
+                weights2_fused_tensor_device = weights2_fused_tensors_per_device[device_idx]
                 gather2_output_tensor_device = gather2_output_tensors_per_device[device_idx]
                 if ccl_enabled:
                     output_tensor_device = output_tensors_per_device[device_idx]
@@ -773,8 +768,10 @@ class PostSDPA:
                 # CB 0: Matmul1 input (from sharded tensor, 8x8 grid)
                 matmul1_in0_cb_descriptor = ttnn.cb_descriptor_from_sharded_tensor(matmul1_in0_cb, input_tensor_device)
 
-                # CB 1: Matmul1 weights (from sharded tensor, 8x8 grid)
-                matmul1_in1_cb_descriptor = ttnn.cb_descriptor_from_sharded_tensor(matmul1_in1_cb, weights1_tensor)
+                # CB 1: Matmul1 weights (from kv_b2 overlapped tensor)
+                matmul1_in1_cb_descriptor = cb_descriptor_from_overlapped_tensor(
+                    matmul1_in1_cb, weights1_tensor, weights1_fused_tensor_device
+                )
 
                 # CB 2: Matmul1 output (4 tiles of 1x32 per core, 8x8 grid)
                 # When kv_cache buffer is available, overlap into it. Otherwise standalone.
@@ -830,8 +827,10 @@ class PostSDPA:
                         format_descriptors=[matmul2_in0_cb_format],
                     )
 
-                # CB 5: Matmul2 weights (from sharded tensor, 112 active matmul2 cores)
-                matmul2_in1_cb_descriptor = ttnn.cb_descriptor_from_sharded_tensor(matmul2_in1_cb, weights2_tensor)
+                # CB 5: Matmul2 weights (from o_proj overlapped tensor)
+                matmul2_in1_cb_descriptor = cb_descriptor_from_overlapped_tensor(
+                    matmul2_in1_cb, weights2_tensor, weights2_fused_tensor_device
+                )
 
                 # CB 6: Matmul2 output (2 tiles of 1x32 per core, 112 active matmul2 cores)
                 matmul2_out_cb_format = ttnn.CBFormatDescriptor(
@@ -1681,8 +1680,8 @@ class PostSDPA:
         # Execute generic_op
         io_tensors = [
             input_tensor_mesh,
-            weights1_tensor,
-            weights2_tensor,
+            weights1_tensor.fused_tensor,
+            weights2_tensor.fused_tensor,
             gather1_output_tensor,
             gather2_output_tensor,
         ]
