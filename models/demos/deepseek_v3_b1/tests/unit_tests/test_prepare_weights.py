@@ -25,19 +25,28 @@ from models.demos.deepseek_v3_b1.blitz_decode_weights import BlitzDecodeWeights,
 from models.demos.deepseek_v3_b1.prepare_weights import (
     AttentionWeights,
     DeepSeekV3DenseLayerWeights,
+    DeepSeekV3EmbeddingLayerWeights,
+    DeepSeekV3LMHeadWeights,
     DeepSeekV3MoELayerWeights,
+    DeepSeekV3Weights,
     DenseRoutedExpertWeights,
     MoERoutedExpertWeights,
     SharedExpertWeights,
     deallocate_weights,
+    load_embedding_weights,
     load_layer,
+    load_lm_head_weights,
     load_moe_routed_experts_from_cache,
     prepare_attention_weights,
+    prepare_embedding_weights,
+    prepare_lm_head_weights,
     prepare_routed_expert_weights,
     prepare_shared_expert_weights,
     prepare_weights,
     save_attention_weights,
+    save_embedding_weights,
     save_layer,
+    save_lm_head_weights,
     save_routed_expert_weights,
     save_shared_expert_weights,
 )
@@ -189,6 +198,9 @@ def _layer_state_dict(
     }
     if is_moe:
         state[f"model.layers.{layer_idx}.mlp.gate.weight"] = torch.randn(256, 7168, generator=g, dtype=torch.bfloat16)
+        state[f"model.layers.{layer_idx}.mlp.gate.e_score_correction_bias"] = torch.randn(
+            256, generator=g, dtype=torch.bfloat16
+        )
         state[f"model.layers.{layer_idx}.mlp.shared_experts.gate_proj.weight"] = torch.randn(
             *shared_hf, generator=g, dtype=torch.bfloat16
         )
@@ -222,6 +234,27 @@ def _layer_state_dict(
         state[f"model.layers.{layer_idx}.mlp.down_proj.weight"] = torch.randn(
             7168, 18432, generator=g, dtype=torch.bfloat16
         )
+    return state
+
+
+def _add_global_weights(state: dict[str, torch.Tensor], seed: int = 42) -> None:
+    """Add embedding, final norm, and lm_head to state (in place)."""
+    g = torch.Generator().manual_seed(seed)
+    state["model.embed_tokens.weight"] = torch.randn(129280, 7168, generator=g, dtype=torch.bfloat16)
+    state["model.norm.weight"] = torch.randn(7168, generator=g, dtype=torch.bfloat16)
+    state["lm_head.weight"] = torch.randn(129280, 7168, generator=g, dtype=torch.bfloat16)
+
+
+def _full_state_dict(
+    num_layers: int,
+    first_k_dense_replace: int,
+    seed: int = 42,
+) -> dict[str, torch.Tensor]:
+    """Build a full state dict with embedding, norm, lm_head, and layer weights."""
+    state = {}
+    _add_global_weights(state, seed=seed)
+    for i in range(num_layers):
+        state.update(_layer_state_dict(i, is_moe=(i >= first_k_dense_replace), seed=seed + 1 + i))
     return state
 
 
@@ -346,7 +379,7 @@ def test_incremental_save_load_dense_4x2(bh_2d_mesh_device, tmp_path):
     if not is_slow_dispatch():
         pytest.skip("load_layer requires slow dispatch")
     submesh = bh_2d_mesh_device.create_submesh(ttnn.MeshShape((4, 2)))
-    state = _layer_state_dict(0, is_moe=False)
+    state = _full_state_dict(1, first_k_dense_replace=1)
     weights = prepare_weights(state, submesh, num_layers=1, first_k_dense_replace=1)
     layer = weights.layers[0]
     assert isinstance(layer, DeepSeekV3DenseLayerWeights)
@@ -402,7 +435,7 @@ def test_incremental_save_load_moe_4x2(bh_2d_mesh_device, tmp_path):
     if not is_slow_dispatch():
         pytest.skip("load_layer requires slow dispatch")
     submesh = bh_2d_mesh_device.create_submesh(ttnn.MeshShape((4, 2)))
-    state = _layer_state_dict(0, is_moe=True, seed=43)
+    state = _full_state_dict(1, first_k_dense_replace=0, seed=43)
     weights = prepare_weights(
         state,
         submesh,
@@ -424,6 +457,7 @@ def test_incremental_save_load_moe_4x2(bh_2d_mesh_device, tmp_path):
         ffn_norm=layer.ffn_norm,
         kv_b1_proj=layer.kv_b1_proj,
         kv_b2_proj=layer.kv_b2_proj,
+        gate_bias=layer.gate_bias,
     )
     shared = SharedExpertWeights(
         shared_gate_proj=layer.shared_gate_proj,
@@ -448,6 +482,7 @@ def test_incremental_save_load_moe_4x2(bh_2d_mesh_device, tmp_path):
     loaded = load_layer(tmp_path, submesh, 0)
     assert isinstance(loaded, DeepSeekV3MoELayerWeights)
     _assert_overlapped_tensors_match(layer.gate_mm, loaded.gate_mm)
+    assert loaded.gate_bias.shape == layer.gate_bias.shape
     _assert_overlapped_tensors_match(layer.shared_gate_proj, loaded.shared_gate_proj)
     assert len(loaded.routed_gate_proj) == NUM_ROUTED_EXPERTS
     assert loaded.routed_gate_proj[0].shape == expected_routed_expert_shape
@@ -535,7 +570,7 @@ def test_prepare_dense_layer_single_layer_4x2(bh_2d_mesh_device):
     """Build one dense layer on 4x2 mesh; verify type and shapes (MLA TP=2)."""
     _skip_unless_4x2_mesh(bh_2d_mesh_device)
     submesh = bh_2d_mesh_device.create_submesh(ttnn.MeshShape((4, 2)))
-    state = _layer_state_dict(0, is_moe=False)
+    state = _full_state_dict(1, first_k_dense_replace=1)
     t0 = time.perf_counter()
     weights = prepare_weights(
         state,
@@ -577,7 +612,7 @@ def test_save_load_dense_layer_single_layer_4x2(bh_2d_mesh_device, tmp_path):
         pytest.skip("load_layer requires slow dispatch")
     submesh = bh_2d_mesh_device.create_submesh(ttnn.MeshShape((4, 2)))
 
-    state = _layer_state_dict(0, is_moe=False)
+    state = _full_state_dict(1, first_k_dense_replace=1)
     t0 = time.perf_counter()
     weights = prepare_weights(state, submesh, num_layers=1, first_k_dense_replace=1)
     elapsed = time.perf_counter() - t0
@@ -664,7 +699,7 @@ def test_prepare_moe_layer_single_layer_4x2(bh_2d_mesh_device):
     """Build one MoE layer on 4x2 mesh; verify type and shapes (MLA TP=2, MoE TP=8)."""
     _skip_unless_4x2_mesh(bh_2d_mesh_device)
     submesh = bh_2d_mesh_device.create_submesh(ttnn.MeshShape((4, 2)))
-    state = _layer_state_dict(0, is_moe=True, seed=43)
+    state = _full_state_dict(1, first_k_dense_replace=0, seed=43)
     logger.info(f"State dict prepared")
     t0 = time.perf_counter()
     logger.info(f"Preparing weights...")
@@ -686,6 +721,7 @@ def test_prepare_moe_layer_single_layer_4x2(bh_2d_mesh_device):
     assert layer.kv_a_proj.tensor_shape == (7168, 576)
     assert layer.o_proj.tensor_shape == (8192, 7168)
     assert layer.gate_mm.tensor_shape == (7168, 256)
+    assert layer.gate_bias.shape is not None
     assert layer.attn_norm.tensor_shape == (1, 7168)
     assert layer.q_norm.tensor_shape == (1, 1536)
     assert layer.kv_norm.tensor_shape == (1, 512)
@@ -712,7 +748,7 @@ def test_save_load_moe_layer_single_layer_4x2(bh_2d_mesh_device, tmp_path):
         pytest.skip("load_layer requires slow dispatch")
     submesh = bh_2d_mesh_device.create_submesh(ttnn.MeshShape((4, 2)))
 
-    state = _layer_state_dict(0, is_moe=True, seed=43)
+    state = _full_state_dict(1, first_k_dense_replace=0, seed=43)
     t0 = time.perf_counter()
     weights = prepare_weights(
         state,
@@ -731,6 +767,7 @@ def test_save_load_moe_layer_single_layer_4x2(bh_2d_mesh_device, tmp_path):
     assert orig.kv_a_proj.tensor_shape == (7168, 576)
     assert orig.o_proj.tensor_shape == (8192, 7168)
     assert orig.gate_mm.tensor_shape == (7168, 256)
+    assert orig.gate_bias.shape is not None
     assert orig.attn_norm.tensor_shape == (1, 7168)
     assert orig.q_norm.tensor_shape == (1, 1536)
     assert orig.kv_norm.tensor_shape == (1, 512)
@@ -760,6 +797,7 @@ def test_save_load_moe_layer_single_layer_4x2(bh_2d_mesh_device, tmp_path):
     assert (tmp_path / "layer_000" / "manifest.json").exists()
     layer_dir = tmp_path / "layer_000"
     assert (layer_dir / "gate_up.tensorbin").exists()
+    assert (layer_dir / "gate_bias.tensorbin").exists()
     assert (layer_dir / "shared_down_proj.tensorbin").exists()
     experts_dir = layer_dir / "experts"
     for e in range(NUM_ROUTED_EXPERTS):
@@ -780,6 +818,7 @@ def test_save_load_moe_layer_single_layer_4x2(bh_2d_mesh_device, tmp_path):
     _assert_overlapped_tensors_match(orig.kv_a_proj, layer.kv_a_proj)
     _assert_overlapped_tensors_match(orig.o_proj, layer.o_proj)
     _assert_overlapped_tensors_match(orig.gate_mm, layer.gate_mm)
+    assert layer.gate_bias.shape == orig.gate_bias.shape
     _assert_overlapped_tensors_match(orig.attn_norm, layer.attn_norm)
     _assert_overlapped_tensors_match(orig.q_norm, layer.q_norm)
     _assert_overlapped_tensors_match(orig.kv_norm, layer.kv_norm)
@@ -813,7 +852,7 @@ def test_load_layer_with_preloaded_routed_experts_4x2(bh_2d_mesh_device, tmp_pat
         pytest.skip("load_layer requires slow dispatch")
     submesh = bh_2d_mesh_device.create_submesh(ttnn.MeshShape((4, 2)))
 
-    state = _layer_state_dict(0, is_moe=True, seed=43)
+    state = _full_state_dict(1, first_k_dense_replace=0, seed=43)
     weights = prepare_weights(
         state,
         submesh,
@@ -848,6 +887,7 @@ def test_load_layer_with_preloaded_routed_experts_4x2(bh_2d_mesh_device, tmp_pat
     assert layer.kv_a_proj.tensor_shape == (7168, 576)
     assert layer.o_proj.tensor_shape == (8192, 7168)
     assert layer.gate_mm.tensor_shape == (7168, 256)
+    assert layer.gate_bias.shape is not None
     assert layer.attn_norm.tensor_shape == (1, 7168)
     assert layer.shared_gate_proj.tensor_shape == (7168, 256)
     assert layer.shared_up_proj.tensor_shape == (7168, 256)
@@ -863,6 +903,73 @@ def test_load_layer_with_preloaded_routed_experts_4x2(bh_2d_mesh_device, tmp_pat
         _assert_on_device(layer.routed_up_proj[e])
         _assert_on_device(layer.routed_down_proj[e])
     _assert_layer_on_device_with_topology(layer)
+
+
+@pytest.mark.parametrize(
+    "device_params",
+    [{"fabric_config": ttnn.FabricConfig.FABRIC_2D}],
+    indirect=True,
+)
+def test_prepare_embedding_weights_4x2(bh_2d_mesh_device):
+    """Prepare embedding weights on 4x2 mesh; verify shape."""
+    _skip_unless_4x2_mesh(bh_2d_mesh_device)
+    submesh = bh_2d_mesh_device.create_submesh(ttnn.MeshShape((4, 2)))
+    state = _full_state_dict(1, first_k_dense_replace=1)
+    weights = prepare_embedding_weights(state, submesh)
+    assert isinstance(weights, DeepSeekV3EmbeddingLayerWeights)
+    assert weights.embedding.shape is not None
+    _assert_on_device(weights.embedding)
+
+
+@pytest.mark.parametrize(
+    "device_params",
+    [{"fabric_config": ttnn.FabricConfig.FABRIC_2D}],
+    indirect=True,
+)
+def test_prepare_lm_head_weights_4x2(bh_2d_mesh_device):
+    """Prepare LM head and final norm weights on 4x2 mesh; verify shapes."""
+    _skip_unless_4x2_mesh(bh_2d_mesh_device)
+    submesh = bh_2d_mesh_device.create_submesh(ttnn.MeshShape((4, 2)))
+    state = _full_state_dict(1, first_k_dense_replace=1)
+    weights = prepare_lm_head_weights(state, submesh)
+    assert isinstance(weights, DeepSeekV3LMHeadWeights)
+    assert weights.lm_head.shape is not None
+    assert weights.final_norm.shape is not None
+    _assert_on_device(weights.lm_head)
+    _assert_on_device(weights.final_norm)
+
+
+@pytest.mark.parametrize(
+    "device_params",
+    [{"fabric_config": ttnn.FabricConfig.FABRIC_2D}],
+    indirect=True,
+)
+def test_save_load_embedding_and_lm_head_weights_4x2(bh_2d_mesh_device, tmp_path):
+    """Save embedding and LM head (with final norm) to disk, load both back, verify on device."""
+    _skip_unless_4x2_mesh(bh_2d_mesh_device)
+    if not is_slow_dispatch():
+        pytest.skip("load requires slow dispatch")
+    submesh = bh_2d_mesh_device.create_submesh(ttnn.MeshShape((4, 2)))
+    state = _full_state_dict(1, first_k_dense_replace=1)
+    embedding_weights = prepare_embedding_weights(state, submesh)
+    lm_head_weights = prepare_lm_head_weights(state, submesh)
+    expected_embedding_shape = embedding_weights.embedding.shape
+    expected_lm_shape = lm_head_weights.lm_head.shape
+    expected_norm_shape = lm_head_weights.final_norm.shape
+
+    save_embedding_weights(embedding_weights, tmp_path, hf_model_name="test", hf_state_dict_name="test.safetensors")
+    save_lm_head_weights(lm_head_weights, tmp_path, hf_model_name="test", hf_state_dict_name="test.safetensors")
+    deallocate_weights(DeepSeekV3Weights(embedding=embedding_weights, layers=[], lm_head=lm_head_weights))
+
+    loaded_embedding = load_embedding_weights(tmp_path, submesh)
+    assert loaded_embedding.embedding.shape == expected_embedding_shape
+    _assert_on_device(loaded_embedding.embedding)
+
+    loaded_lm_head = load_lm_head_weights(tmp_path, submesh)
+    assert loaded_lm_head.lm_head.shape == expected_lm_shape
+    assert loaded_lm_head.final_norm.shape == expected_norm_shape
+    _assert_on_device(loaded_lm_head.lm_head)
+    _assert_on_device(loaded_lm_head.final_norm)
 
 
 @pytest.mark.skip(reason="Too slow for CI; use for manual multi-submesh validation")
@@ -903,6 +1010,7 @@ def test_load_4_layers_across_4_submeshes_4x2(bh_2d_mesh_device, tmp_path):
         )
         # prepare_weights always looks up model.layers.0.* when num_layers=1; remap keys
         state_for_prepare = {k.replace(f"model.layers.{layer_idx}.", "model.layers.0."): v for k, v in state.items()}
+        _add_global_weights(state_for_prepare, seed=42 + layer_idx)
         # first_k_dense_replace so the single layer (index 0) is dense or MoE
         first_k = 1 if layer_idx < first_k_dense_replace else 0
         t0 = time.perf_counter()

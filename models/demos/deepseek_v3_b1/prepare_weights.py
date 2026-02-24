@@ -69,6 +69,7 @@ class AttentionWeights:
     ffn_norm: OverlappedTensor
     kv_b1_proj: OverlappedTensor
     kv_b2_proj: OverlappedTensor
+    gate_bias: ttnn.Tensor | None  # e_score_correction_bias for MoE only
 
 
 @dataclass
@@ -152,6 +153,9 @@ class DeepSeekV3MoELayerWeights:
     kv_norm: OverlappedTensor
     ffn_norm: OverlappedTensor
 
+    # MoE gate e_score_correction_bias (standalone)
+    gate_bias: ttnn.Tensor
+
     # From get_tt_kv_b12_proj_weights
     kv_b1_proj: OverlappedTensor
     kv_b2_proj: OverlappedTensor
@@ -176,9 +180,10 @@ class DeepSeekV3EmbeddingLayerWeights:
 
 @dataclass
 class DeepSeekV3LMHeadWeights:
-    """Weights for the LM head."""
+    """Weights for the LM head and final RMSNorm."""
 
     lm_head: ttnn.Tensor
+    final_norm: ttnn.Tensor  # model.norm.weight, (1, 7168)
 
 
 DeepSeekV3LayerWeights = (
@@ -188,9 +193,11 @@ DeepSeekV3LayerWeights = (
 
 @dataclass
 class DeepSeekV3Weights:
-    """Container for all prepared (fused) layer weights."""
+    """Container for all prepared (fused) weights: embedding, layers, lm_head."""
 
+    embedding: DeepSeekV3EmbeddingLayerWeights
     layers: list[DeepSeekV3LayerWeights]
+    lm_head: DeepSeekV3LMHeadWeights
 
 
 # Constants for kv_b_proj split (HF stores one matrix; we split into kv_b1 and kv_b2).
@@ -302,6 +309,16 @@ def prepare_attention_weights(
             o_proj, gate_mm, attn_norm, q_norm, kv_norm, ffn_norm, move_to_device=False
         )
         o_proj_ot, gate_mm_ot, attn_norm_ot, q_norm_ot, kv_norm_ot, ffn_norm_ot = o_norms
+        # e_score_correction_bias: (256,) -> (16, 16) reshape + transpose for MoE op
+        gate_bias_raw = state_dict[_key(layer_idx, "mlp.gate.e_score_correction_bias")]
+        gate_bias_reshaped = gate_bias_raw.reshape(16, 16).T.contiguous()
+        gate_bias_tt = ttnn.from_torch(
+            gate_bias_reshaped.to(torch.bfloat16),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=bdw._device,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
         logger.debug("  convert o_proj_gate_mm_norms (MoE): {:.3f}s", time.perf_counter() - t0)
         return AttentionWeights(
             q_a_proj=q_a_proj,
@@ -315,6 +332,7 @@ def prepare_attention_weights(
             ffn_norm=ffn_norm_ot,
             kv_b1_proj=kv_b1_proj,
             kv_b2_proj=kv_b2_proj,
+            gate_bias=gate_bias_tt,
         )
     else:
         gate_mm_dummy = torch.zeros(7168, 256, dtype=torch.bfloat16, device=next(iter(state_dict.values())).device)
@@ -335,6 +353,7 @@ def prepare_attention_weights(
             ffn_norm=ffn_norm_ot,
             kv_b1_proj=kv_b1_proj,
             kv_b2_proj=kv_b2_proj,
+            gate_bias=None,
         )
 
 
@@ -474,6 +493,7 @@ def prepare_moe_decoder_layer_weights(
         bdw, state_dict, layer_idx, is_moe=True, num_routed_experts=num_routed_experts
     )
     assert isinstance(attn.gate_mm, OverlappedTensor)
+    assert attn.gate_bias is not None
     assert isinstance(routed, MoERoutedExpertWeights)
     return DeepSeekV3MoELayerWeights(
         q_a_proj=attn.q_a_proj,
@@ -485,6 +505,7 @@ def prepare_moe_decoder_layer_weights(
         q_norm=attn.q_norm,
         kv_norm=attn.kv_norm,
         ffn_norm=attn.ffn_norm,
+        gate_bias=attn.gate_bias,
         kv_b1_proj=attn.kv_b1_proj,
         kv_b2_proj=attn.kv_b2_proj,
         shared_gate_proj=shared.shared_gate_proj,
@@ -495,6 +516,121 @@ def prepare_moe_decoder_layer_weights(
         routed_down_proj=routed.routed_down_proj,
     )
     logger.info("  MoE layer {} done in {:.3f}s", layer_idx, time.perf_counter() - t0)
+
+
+def prepare_embedding_weights(
+    state_dict: dict[str, torch.Tensor],
+    device,
+) -> DeepSeekV3EmbeddingLayerWeights:
+    """Prepare embedding weights from state dict (model.embed_tokens.weight)."""
+    logger.info("Preparing embedding weights...")
+    w = state_dict["model.embed_tokens.weight"]
+    assert w.shape == (129280, 7168), f"Expected embedding shape (129280, 7168), got {w.shape}"
+    embedding_tt = ttnn.from_torch(
+        w.contiguous(),
+        dtype=ttnn.bfloat16,
+        layout=ttnn.TILE_LAYOUT,
+        device=device,
+        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+    )
+    return DeepSeekV3EmbeddingLayerWeights(embedding=embedding_tt)
+
+
+def save_embedding_weights(
+    weights: DeepSeekV3EmbeddingLayerWeights,
+    path: str | Path,
+    *,
+    hf_model_name: str = "",
+    hf_state_dict_name: str = "",
+    device_mesh_shape: tuple[int, int] = (1, 1),
+) -> None:
+    """Save embedding weights to <path>/embedding/."""
+    path = Path(path)
+    emb_dir = path / "embedding"
+    emb_dir.mkdir(parents=True, exist_ok=True)
+    ttnn.dump_tensor(emb_dir / "embedding.tensorbin", weights.embedding)
+    manifest = {
+        "version": _MANIFEST_VERSION,
+        "hf_model_name": hf_model_name,
+        "hf_state_dict_name": hf_state_dict_name,
+        "device_mesh_shape": list(device_mesh_shape),
+    }
+    with open(emb_dir / "manifest.json", "w") as f:
+        json.dump(manifest, f, indent=2)
+
+
+def load_embedding_weights(path: str | Path, device) -> DeepSeekV3EmbeddingLayerWeights:
+    """Load embedding weights from <path>/embedding/."""
+    path = Path(path)
+    emb_dir = path / "embedding"
+    if not emb_dir.is_dir():
+        raise FileNotFoundError(f"Embedding dir not found: {emb_dir}")
+    embedding = ttnn.load_tensor(emb_dir / "embedding.tensorbin", device=device)
+    return DeepSeekV3EmbeddingLayerWeights(embedding=embedding)
+
+
+def prepare_lm_head_weights(
+    state_dict: dict[str, torch.Tensor],
+    device,
+) -> DeepSeekV3LMHeadWeights:
+    """Prepare LM head and final norm weights from state dict."""
+    logger.info("Preparing LM head and final norm weights...")
+    # lm_head.weight: HF (vocab_size, hidden_size) = (129280, 7168) -> (7168, 129280) for matmul
+    lm_w = state_dict["lm_head.weight"]
+    assert lm_w.shape == (129280, 7168), f"Expected lm_head shape (129280, 7168), got {lm_w.shape}"
+    lm_head_tt = ttnn.from_torch(
+        lm_w.T.contiguous(),
+        dtype=ttnn.bfloat16,
+        layout=ttnn.TILE_LAYOUT,
+        device=device,
+        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+    )
+    # model.norm.weight: (7168,) -> (1, 7168)
+    norm_w = state_dict["model.norm.weight"]
+    assert norm_w.shape == (7168,), f"Expected final norm shape (7168,), got {norm_w.shape}"
+    final_norm_tt = ttnn.from_torch(
+        norm_w.unsqueeze(0).contiguous(),
+        dtype=ttnn.bfloat16,
+        layout=ttnn.TILE_LAYOUT,
+        device=device,
+        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+    )
+    return DeepSeekV3LMHeadWeights(lm_head=lm_head_tt, final_norm=final_norm_tt)
+
+
+def save_lm_head_weights(
+    weights: DeepSeekV3LMHeadWeights,
+    path: str | Path,
+    *,
+    hf_model_name: str = "",
+    hf_state_dict_name: str = "",
+    device_mesh_shape: tuple[int, int] = (1, 1),
+) -> None:
+    """Save LM head and final norm weights to <path>/lm_head/."""
+    path = Path(path)
+    lm_dir = path / "lm_head"
+    lm_dir.mkdir(parents=True, exist_ok=True)
+    ttnn.dump_tensor(lm_dir / "lm_head.tensorbin", weights.lm_head)
+    ttnn.dump_tensor(lm_dir / "final_norm.tensorbin", weights.final_norm)
+    manifest = {
+        "version": _MANIFEST_VERSION,
+        "hf_model_name": hf_model_name,
+        "hf_state_dict_name": hf_state_dict_name,
+        "device_mesh_shape": list(device_mesh_shape),
+    }
+    with open(lm_dir / "manifest.json", "w") as f:
+        json.dump(manifest, f, indent=2)
+
+
+def load_lm_head_weights(path: str | Path, device) -> DeepSeekV3LMHeadWeights:
+    """Load LM head and final norm weights from <path>/lm_head/."""
+    path = Path(path)
+    lm_dir = path / "lm_head"
+    if not lm_dir.is_dir():
+        raise FileNotFoundError(f"LM head dir not found: {lm_dir}")
+    lm_head = ttnn.load_tensor(lm_dir / "lm_head.tensorbin", device=device)
+    final_norm = ttnn.load_tensor(lm_dir / "final_norm.tensorbin", device=device)
+    return DeepSeekV3LMHeadWeights(lm_head=lm_head, final_norm=final_norm)
 
 
 def prepare_weights(
@@ -527,6 +663,7 @@ def prepare_weights(
         num_layers - 1,
     )
     total_t0 = time.perf_counter()
+    embedding = prepare_embedding_weights(state_dict, device)
     bdw = BlitzDecodeWeights(device)
     layers: list[DeepSeekV3LayerWeights] = []
 
@@ -537,8 +674,9 @@ def prepare_weights(
         else:
             layers.append(prepare_dense_decoder_layer_weights(bdw, state_dict, i))
 
+    lm_head = prepare_lm_head_weights(state_dict, device)
     logger.info("All {} layers prepared in {:.3f}s", num_layers, time.perf_counter() - total_t0)
-    return DeepSeekV3Weights(layers=layers)
+    return DeepSeekV3Weights(embedding=embedding, layers=layers, lm_head=lm_head)
 
 
 def _deallocate_tt_tensor(t: ttnn.Tensor, seen: set[int]) -> None:
@@ -556,6 +694,9 @@ def deallocate_weights(weights: DeepSeekV3Weights) -> None:
     OOM (the original and loaded weights would otherwise both reside on device).
     """
     seen: set[int] = set()
+    _deallocate_tt_tensor(weights.embedding.embedding, seen)
+    _deallocate_tt_tensor(weights.lm_head.lm_head, seen)
+    _deallocate_tt_tensor(weights.lm_head.final_norm, seen)
     for layer in weights.layers:
         for _name, ot in _layer_overlapped_tensor_fields(layer):
             fid = id(ot.fused_tensor)
@@ -565,6 +706,7 @@ def deallocate_weights(weights: DeepSeekV3Weights) -> None:
         if hasattr(layer, "shared_down_proj"):
             _deallocate_tt_tensor(getattr(layer, "shared_down_proj"), seen)
         if isinstance(layer, DeepSeekV3MoELayerWeights):
+            _deallocate_tt_tensor(layer.gate_bias, seen)
             for t in layer.routed_gate_proj:
                 _deallocate_tt_tensor(t, seen)
             for t in layer.routed_up_proj:
@@ -744,6 +886,9 @@ def save_attention_weights(
         field_tuples.append(("gate_mm", attn.gate_mm))
     new_groups = _dump_overlapped_fusion_groups(layer_dir, field_tuples)
     manifest.setdefault("fusion_groups", {}).update(new_groups)
+    if attn.gate_bias is not None:
+        ttnn.dump_tensor(layer_dir / "gate_bias.tensorbin", attn.gate_bias)
+        manifest.setdefault("standalone_tensors", {})["gate_bias"] = "gate_bias.tensorbin"
     with open(layer_dir / "manifest.json", "w") as f:
         json.dump(manifest, f, indent=2)
     logger.debug("  save_attention_weights: {:.3f}s", time.perf_counter() - t0)
@@ -875,6 +1020,7 @@ def save_layer(
         ffn_norm=layer.ffn_norm,
         kv_b1_proj=layer.kv_b1_proj,
         kv_b2_proj=layer.kv_b2_proj,
+        gate_bias=getattr(layer, "gate_bias", None),
     )
     shared = SharedExpertWeights(
         shared_gate_proj=layer.shared_gate_proj,
@@ -1085,6 +1231,7 @@ def load_layer(
 
         standalone = manifest.get("standalone_tensors", {})
         shared_down_proj = ttnn.load_tensor(layer_dir / standalone["shared_down_proj"], device=device)
+        gate_bias = ttnn.load_tensor(layer_dir / standalone["gate_bias"], device=device)
         if preloaded_routed_experts is not None:
             routed_gate_proj = preloaded_routed_experts.routed_gate_proj
             routed_up_proj = preloaded_routed_experts.routed_up_proj
@@ -1122,6 +1269,7 @@ def load_layer(
             q_norm=q_norm,
             kv_norm=kv_norm,
             ffn_norm=ffn_norm,
+            gate_bias=gate_bias,
             kv_b1_proj=kv_b1_proj,
             kv_b2_proj=kv_b2_proj,
             shared_gate_proj=shared_gate_proj,
@@ -1141,8 +1289,16 @@ def save_weights(
     hf_state_dict_name: str,
     device_mesh_shape: tuple[int, int] = (1, 1),
 ) -> None:
-    """Serialize all layers to disk. Convenience wrapper around save_layer."""
+    """Serialize embedding, all layers, and lm_head to disk."""
     path = Path(path)
+    path.mkdir(parents=True, exist_ok=True)
+    manifest_kw = dict(
+        hf_model_name=hf_model_name,
+        hf_state_dict_name=hf_state_dict_name,
+        device_mesh_shape=device_mesh_shape,
+    )
+    logger.info("Saving embedding to {}...", path)
+    save_embedding_weights(weights.embedding, path, **manifest_kw)
     num_layers = len(weights.layers)
     logger.info("Saving all {} layers to {}...", num_layers, path)
     total_t0 = time.perf_counter()
@@ -1155,6 +1311,8 @@ def save_weights(
             hf_state_dict_name=hf_state_dict_name,
             device_mesh_shape=device_mesh_shape,
         )
+    logger.info("Saving LM head to {}...", path)
+    save_lm_head_weights(weights.lm_head, path, **manifest_kw)
     logger.info("All {} layers saved in {:.3f}s", num_layers, time.perf_counter() - total_t0)
 
 
@@ -1163,12 +1321,16 @@ def load_weights(
     device,
     num_layers: int = 61,
 ) -> DeepSeekV3Weights:
-    """Deserialize layers from disk. Convenience wrapper: load_layer for each index."""
+    """Deserialize embedding, layers, and lm_head from disk."""
     path = Path(path)
     if not path.is_dir():
         raise FileNotFoundError(f"Weights path is not a directory: {path}")
+    logger.info("Loading embedding from {}...", path)
+    embedding = load_embedding_weights(path, device)
     logger.info("Loading all {} layers from {}...", num_layers, path)
     total_t0 = time.perf_counter()
     layers = [load_layer(path, device, i) for i in range(num_layers)]
     logger.info("All {} layers loaded in {:.3f}s", num_layers, time.perf_counter() - total_t0)
-    return DeepSeekV3Weights(layers=layers)
+    logger.info("Loading LM head from {}...", path)
+    lm_head = load_lm_head_weights(path, device)
+    return DeepSeekV3Weights(embedding=embedding, layers=layers, lm_head=lm_head)
