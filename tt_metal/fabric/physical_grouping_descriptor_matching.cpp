@@ -796,7 +796,7 @@ bool is_flattened(const GroupingInfo& grouping) {
 
 namespace tt::tt_fabric {
 
-MappingResult<uint32_t, AsicID> solve_for_many_groupings_to_psd(
+std::vector<MappingResult<uint32_t, AsicID>> solve_for_many_groupings_to_psd(
     const GroupingInfo& grouping_info,
     const AdjacencyGraph<AsicID>& physical_graph,
     const tt::tt_metal::PhysicalSystemDescriptor& physical_system_descriptor) {
@@ -901,7 +901,42 @@ MappingResult<uint32_t, AsicID> solve_for_many_groupings_to_psd(
             "Internal error: Failed to add required trait constraint for asic_location");
     }
 
-    return solve_topology_mapping(all_meshes, physical_graph, constraints, ConnectionValidationMode::RELAXED, true);
+    // Solve topology mapping for all copies combined
+    MappingResult<uint32_t, AsicID> combined_result =
+        solve_topology_mapping(all_meshes, physical_graph, constraints, ConnectionValidationMode::RELAXED, true);
+
+    // If mapping failed, return empty vector
+    if (!combined_result.success) {
+        return {};
+    }
+
+    // Step 5: Split the combined result into individual results for each copy
+    std::vector<MappingResult<uint32_t, AsicID>> results;
+
+    // Group mappings by copy index
+    std::map<size_t, std::map<uint32_t, AsicID>> copy_mappings;
+    for (const auto& [target_node, asic_id] : combined_result.target_to_global) {
+        size_t copy_idx = target_node / unique_id_offset;
+        // Map back to original node ID within the copy
+        uint32_t original_node_id = target_node % unique_id_offset;
+        copy_mappings[copy_idx][original_node_id] = asic_id;
+    }
+
+    // Create a MappingResult for each copy
+    for (const auto& [copy_idx, mappings] : copy_mappings) {
+        MappingResult<uint32_t, AsicID> copy_result;
+        copy_result.success = true;
+        copy_result.target_to_global = mappings;
+
+        // Build reverse mapping (global_to_target)
+        for (const auto& [target_node, asic_id] : mappings) {
+            copy_result.global_to_target[asic_id] = target_node;
+        }
+
+        results.push_back(std::move(copy_result));
+    }
+
+    return results;
 }
 }  // namespace tt::tt_fabric
 
@@ -988,9 +1023,70 @@ std::vector<std::unordered_set<tt::tt_metal::AsicID>> PhysicalGroupingDescriptor
     const GroupingInfo& grouping,
     const tt::tt_metal::PhysicalSystemDescriptor& physical_system_descriptor,
     std::vector<std::string>& errors_out) const {
-    // TODO: Implement find_all_in_psd
-    (void)grouping;
-    (void)physical_system_descriptor;
-    (void)errors_out;
-    return {};
+    // Build physical adjacency map from PSD (empty map means include all ASICs)
+    PhysicalAdjacencyMap physical_adj_map = build_flat_adjacency_map_from_psd(physical_system_descriptor);
+    // Convert to AdjacencyGraph
+    AdjacencyGraph<AsicID> physical_graph(physical_adj_map);
+
+    // Detect if its flattened or not, if it its not then flatten it
+    std::vector<GroupingInfo> flat_meshes;
+    if (!is_flattened(grouping)) {
+        flat_meshes = build_flattened_adjacency_mesh(grouping, physical_system_descriptor);
+    } else {
+        flat_meshes.push_back(grouping);
+    }
+
+    std::vector<std::unordered_set<tt::tt_metal::AsicID>> all_asic_id_sets;
+
+    // Try all flat meshes and collect all successful mappings
+    for (const auto& flat_mesh : flat_meshes) {
+        if (flat_mesh.adjacency_graph.get_nodes().empty()) {
+            continue;
+        }
+
+        // Try to fit multiple copies - returns a vector of MappingResult, one per copy
+        auto many_results = solve_for_many_groupings_to_psd(flat_mesh, physical_graph, physical_system_descriptor);
+
+        // Extract ASIC IDs from each result
+        for (const auto& result : many_results) {
+            if (result.success) {
+                std::unordered_set<tt::tt_metal::AsicID> asic_set;
+                for (const auto& [target_node, asic_id] : result.target_to_global) {
+                    asic_set.insert(asic_id);
+                }
+                all_asic_id_sets.push_back(std::move(asic_set));
+            }
+        }
+    }
+
+    // If no mappings found, populate errors
+    if (all_asic_id_sets.empty()) {
+        if (flat_meshes.empty()) {
+            // No flattened meshes were produced - grouping cannot be mapped to this PSD
+            errors_out.push_back("No valid groupings found for PSD");
+        } else {
+            // Check if there's an actual internal error (all meshes have empty graphs)
+            bool all_empty = true;
+            const GroupingInfo* last_non_empty_mesh = nullptr;
+            for (const auto& flat_mesh : flat_meshes) {
+                if (!flat_mesh.adjacency_graph.get_nodes().empty()) {
+                    all_empty = false;
+                    last_non_empty_mesh = &flat_mesh;
+                }
+            }
+
+            if (all_empty) {
+                errors_out.push_back("Internal error: grouping produced empty graph");
+            } else {
+                // Try to get error message from last attempted mesh with non-empty graph
+                // Use the last non-empty mesh if available, otherwise fall back to last mesh
+                const GroupingInfo& mesh_to_use =
+                    (last_non_empty_mesh != nullptr) ? *last_non_empty_mesh : flat_meshes.back();
+                auto result = solve_for_one_grouping_to_psd(mesh_to_use, physical_graph, physical_system_descriptor);
+                errors_out.push_back(build_pgd_mapping_failure_message(grouping.name, mesh_to_use, result));
+            }
+        }
+    }
+
+    return all_asic_id_sets;
 }
