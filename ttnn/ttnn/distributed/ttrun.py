@@ -251,7 +251,7 @@ def parse_binding_config(yaml_path: Path, mock_cluster_rank_binding: Optional[Pa
     return config
 
 
-DEFAULT_TRACY_BASE_PORT = 8086
+DEFAULT_TRACY_BASE_PORT = 8087
 
 
 @dataclass
@@ -564,7 +564,6 @@ def wrap_program_with_tracy(
 
     extra_env = {
         "TT_METAL_PROFILER_DIR": str(rank_output_dir),
-        "TRACY_PORT": str(port),
     }
 
     return tracy_cmd, extra_env
