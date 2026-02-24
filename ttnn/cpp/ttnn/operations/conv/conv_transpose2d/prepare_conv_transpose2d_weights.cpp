@@ -302,6 +302,39 @@ ttnn::Tensor prepare_conv_transpose2d_weights(
         dram_slice_config,
         convt2d_slice_attr->name());
 
+    // If auto-determination resulted in num_slices=1 (trivial slicing), use L1 path instead
+    // This avoids unnecessary DRAM slicing overhead for single-slice cases
+    if (dram_slice_config.num_slices == 1) {
+        log_debug(tt::LogOp, "Auto-determined num_slices=1, using L1 path for weight preparation");
+        // For transposed conv2d, the conv2d micro-op always uses stride=1x1 and operates on
+        // "full_input" dimensions (after halo/padding expansion), not the original input dimensions.
+        auto dims = compute_conv_transpose2d_dimensions(
+            input_height, input_width, kernel_size, stride, padding, {0, 0}, dilation);
+
+        return prepare_conv_weights(
+            mirrored_weight_tensor,
+            input_memory_config,
+            input_layout,
+            weights_format,
+            in_channels,
+            out_channels,
+            batch_size,
+            dims.full_input_height,  // Use full_input dimensions, not original
+            dims.full_input_width,   // Use full_input dimensions, not original
+            kernel_size,
+            ConvTranspose2dDimensions::CONV2D_STRIDE,   // stride is always 1x1 for conv2d micro-op
+            ConvTranspose2dDimensions::CONV2D_PADDING,  // padding is 0 (halo already added padding)
+            dilation,
+            has_bias,
+            groups_for_prep,  // Use 1 if groups > 1 since grouped conversion is already done
+            device,
+            input_dtype,
+            output_dtype,
+            conv_config_,
+            compute_config_,
+            op_slicing::Op2DSliceConfig{.slice_type = op_slicing::Op2DSliceConfig::SliceType::L1_FULL});
+    }
+
     uint32_t slice_rounding_value = 1;
     if (conv_config.output_layout == tt::tt_metal::Layout::TILE &&
         dram_slice_config.slice_type == Conv2dSliceConfig::SliceType::DRAM_WIDTH) {

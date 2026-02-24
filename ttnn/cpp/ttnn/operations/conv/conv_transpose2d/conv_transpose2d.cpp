@@ -983,6 +983,13 @@ ConvT2dExecutionPath determine_conv_transpose2d_execution_path(
         return ConvT2dExecutionPath::L1;
     }
 
+    // If slice config has num_slices == 1 (trivial slicing), use L1 path
+    // to avoid the overhead of DRAM slicing infrastructure for a single slice
+    if (slice_config.has_value() && slice_config->num_slices == 1) {
+        log_debug(tt::LogOp, "Using L1 path for trivial DRAM slice config with num_slices=1");
+        return ConvT2dExecutionPath::L1;
+    }
+
     // If no slice config and input is already on device in L1, use L1 path
     if (!slice_config.has_value() && storage_type == tt::tt_metal::StorageType::DEVICE && memory_config.is_l1()) {
         return ConvT2dExecutionPath::L1;

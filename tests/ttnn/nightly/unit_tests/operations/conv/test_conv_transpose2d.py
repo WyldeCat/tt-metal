@@ -279,21 +279,6 @@ def test_convt2d_dram(
 ):
     if device.core_grid.y != 8 and is_wormhole_b0():
         pytest.skip("Needs 8x8 Grid for Wormhole_b0")
-    if (
-        batch_size == 16
-        and input_height == 16
-        and input_width == 16
-        and input_channels == 256
-        and output_channels == 128
-        and filter_height == 2
-        and filter_width == 2
-        and shard_layout == ttnn.TensorMemoryLayout.BLOCK_SHARDED
-        and num_slices == 1
-        and activations_dtype == ttnn.bfloat16
-        and layout == ttnn.ROW_MAJOR_LAYOUT
-        and preprocess_weights
-    ):
-        pytest.skip("These cases fail all close checks see #38257")
     dram_slice_config = ttnn.Conv2dSliceConfig(
         slice_type=slice_type,
         num_slices=0 if auto_slice else num_slices,
