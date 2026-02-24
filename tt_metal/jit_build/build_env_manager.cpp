@@ -6,8 +6,6 @@
 
 #include <tracy/Tracy.hpp>
 #include <cstddef>
-#include <map>
-#include <string>
 
 #include <tt_stl/assert.hpp>
 #include "hal_types.hpp"
@@ -15,7 +13,6 @@
 #include "jit_build/build.hpp"
 #include "jit_build/jit_device_config.hpp"
 #include "llrt/hal.hpp"
-#include "llrt/rtoptions.hpp"
 
 namespace tt::tt_metal {
 
