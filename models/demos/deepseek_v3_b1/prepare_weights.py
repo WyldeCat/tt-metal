@@ -206,6 +206,29 @@ def _key(layer_idx: int, suffix: str) -> str:
     return f"model.layers.{layer_idx}.{suffix}"
 
 
+def create_gate_bias_tensor(raw_tensor: torch.Tensor, device) -> ttnn.Tensor:
+    """Build gate_bias (e_score_correction_bias) as HEIGHT_SHARDED on sender core, replicated across mesh.
+
+    raw_tensor: shape (256,) from state dict (model.layers.{i}.mlp.gate.e_score_correction_bias).
+    Returns ttnn.Tensor with layout expected by MoE op: (16, 16) on sender core (10, 9), tile 16x16.
+    """
+    gate_bias_reshaped = raw_tensor.reshape(16, 16).T.contiguous().to(torch.bfloat16)
+    gate_bias_mem_config = ttnn.MemoryConfig(
+        ttnn.TensorMemoryLayout.HEIGHT_SHARDED,
+        ttnn.BufferType.L1,
+        ttnn.ShardSpec(_MOE_SENDER_CORE_GRID, (16, 16), ttnn.ShardOrientation.ROW_MAJOR),
+    )
+    return ttnn.from_torch(
+        gate_bias_reshaped,
+        dtype=ttnn.bfloat16,
+        layout=ttnn.TILE_LAYOUT,
+        device=None,
+        memory_config=gate_bias_mem_config,
+        tile=_GATE_BIAS_TILE,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(device),
+    )
+
+
 def _split_kv_b_proj(kv_b_proj: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Split HF kv_b_proj (out_features, in_features) into kv_b1 and kv_b2.
 
@@ -300,22 +323,8 @@ def prepare_attention_weights(
             o_proj, gate_mm, attn_norm, q_norm, kv_norm, ffn_norm, move_to_device=False
         )
         o_proj_ot, gate_mm_ot, attn_norm_ot, q_norm_ot, kv_norm_ot, ffn_norm_ot = o_norms
-        # e_score_correction_bias: (256,) -> (16, 16) reshape + transpose for MoE op
-        gate_bias_raw = state_dict[_key(layer_idx, "mlp.gate.e_score_correction_bias")]
-        gate_bias_reshaped = gate_bias_raw.reshape(16, 16).T.contiguous()
-        gate_bias_mem_config = ttnn.MemoryConfig(
-            ttnn.TensorMemoryLayout.HEIGHT_SHARDED,
-            ttnn.BufferType.L1,
-            ttnn.ShardSpec(_MOE_SENDER_CORE_GRID, (16, 16), ttnn.ShardOrientation.ROW_MAJOR),
-        )
-        gate_bias_tt = ttnn.from_torch(
-            gate_bias_reshaped.to(torch.bfloat16),
-            dtype=ttnn.bfloat16,
-            layout=ttnn.TILE_LAYOUT,
-            device=None,
-            memory_config=gate_bias_mem_config,
-            tile=_GATE_BIAS_TILE,
-            mesh_mapper=ttnn.ReplicateTensorToMesh(bdw._device),
+        gate_bias_tt = create_gate_bias_tensor(
+            state_dict[_key(layer_idx, "mlp.gate.e_score_correction_bias")], bdw._device
         )
         logger.debug("  convert o_proj_gate_mm_norms (MoE): {:.3f}s", time.perf_counter() - t0)
         return AttentionWeights(

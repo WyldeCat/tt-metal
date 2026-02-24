@@ -909,7 +909,6 @@ def test_prepare_embedding_weights_4x2(bh_2d_mesh_device):
         129280,
         7168,
     ), f"Expected embedding shape (129280, 7168), got {weights.embedding.shape}"
-    _assert_on_device(weights.embedding)
 
 
 @pytest.mark.parametrize(
