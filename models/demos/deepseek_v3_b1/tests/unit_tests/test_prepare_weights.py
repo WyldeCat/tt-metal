@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-Tests for prepare_weights: building DeepSeekV3Weights from a state dict (4x2 mesh only).
+Tests for prepare_weights: per-layer prepare/save/load on 4x2 mesh.
 
 - test_prepare_dense_layer_single_layer_4x2 / test_prepare_moe_layer_single_layer_4x2: one layer on 4x2 mesh.
 - test_save_load_dense_layer_single_layer_4x2 / test_save_load_moe_layer_single_layer_4x2: save then load one layer on 4x2 submesh.
@@ -28,28 +28,65 @@ from models.demos.deepseek_v3_b1.prepare_weights import (
     DeepSeekV3EmbeddingLayerWeights,
     DeepSeekV3LMHeadWeights,
     DeepSeekV3MoELayerWeights,
-    DeepSeekV3Weights,
     DenseRoutedExpertWeights,
     MoERoutedExpertWeights,
     SharedExpertWeights,
-    deallocate_weights,
+    load_dense_decoder_layer,
     load_embedding_weights,
-    load_layer,
     load_lm_head_weights,
-    load_moe_routed_experts_from_cache,
+    load_moe_decoder_layer,
     prepare_attention_weights,
+    prepare_dense_layer_weights,
     prepare_embedding_weights,
     prepare_lm_head_weights,
+    prepare_moe_layer_weights,
     prepare_routed_expert_weights,
     prepare_shared_expert_weights,
-    prepare_weights,
     save_attention_weights,
+    save_decoder_layer,
     save_embedding_weights,
-    save_layer,
     save_lm_head_weights,
     save_routed_expert_weights,
     save_shared_expert_weights,
 )
+
+
+def _deallocate_layer(layer: DeepSeekV3DenseLayerWeights | DeepSeekV3MoELayerWeights) -> None:
+    """Deallocate all tensors in a single decoder layer (for tests that save then load)."""
+    seen: set[int] = set()
+    for f in (
+        "q_a_proj",
+        "q_b_proj",
+        "kv_a_proj",
+        "o_proj",
+        "attn_norm",
+        "q_norm",
+        "kv_norm",
+        "ffn_norm",
+        "kv_b1_proj",
+        "kv_b2_proj",
+        "shared_gate_proj",
+        "shared_up_proj",
+    ):
+        ot = getattr(layer, f, None)
+        if ot is not None and hasattr(ot, "fused_tensor"):
+            fid = id(ot.fused_tensor)
+            if fid not in seen:
+                seen.add(fid)
+                ttnn.deallocate(ot.fused_tensor, force=True)
+    ttnn.deallocate(layer.shared_down_proj, force=True)
+    if isinstance(layer, DeepSeekV3MoELayerWeights):
+        ttnn.deallocate(layer.gate_bias, force=True)
+        for t in layer.routed_gate_proj:
+            ttnn.deallocate(t, force=True)
+        for t in layer.routed_up_proj:
+            ttnn.deallocate(t, force=True)
+        for t in layer.routed_down_proj:
+            ttnn.deallocate(t, force=True)
+    else:
+        ttnn.deallocate(layer.routed_gate_proj, force=True)
+        ttnn.deallocate(layer.routed_up_proj, force=True)
+        ttnn.deallocate(layer.routed_down_proj, force=True)
 
 
 def _core_range_set_to_tuples(crs):
@@ -245,19 +282,6 @@ def _add_global_weights(state: dict[str, torch.Tensor], seed: int = 42) -> None:
     state["lm_head.weight"] = torch.randn(129280, 7168, generator=g, dtype=torch.bfloat16)
 
 
-def _full_state_dict(
-    num_layers: int,
-    first_k_dense_replace: int,
-    seed: int = 42,
-) -> dict[str, torch.Tensor]:
-    """Build a full state dict with embedding, norm, lm_head, and layer weights."""
-    state = {}
-    _add_global_weights(state, seed=seed)
-    for i in range(num_layers):
-        state.update(_layer_state_dict(i, is_moe=(i >= first_k_dense_replace), seed=seed + 1 + i))
-    return state
-
-
 @pytest.mark.parametrize(
     "device_params",
     [{"fabric_config": ttnn.FabricConfig.FABRIC_2D}],
@@ -374,14 +398,14 @@ def test_prepare_routed_expert_weights_moe_4x2(bh_2d_mesh_device):
     indirect=True,
 )
 def test_incremental_save_load_dense_4x2(bh_2d_mesh_device, tmp_path):
-    """Save dense layer on 4x2 via separate save_attention_weights, save_shared_expert_weights, save_routed_expert_weights; load_layer and verify."""
+    """Save dense layer on 4x2 via separate save_attention_weights, save_shared_expert_weights, save_routed_expert_weights; load_dense_decoder_layer and verify."""
     _skip_unless_4x2_mesh(bh_2d_mesh_device)
     if not is_slow_dispatch():
-        pytest.skip("load_layer requires slow dispatch")
+        pytest.skip("load_dense_decoder_layer requires slow dispatch")
     submesh = bh_2d_mesh_device.create_submesh(ttnn.MeshShape((4, 2)))
-    state = _full_state_dict(1, first_k_dense_replace=1)
-    weights = prepare_weights(state, submesh, num_layers=1, first_k_dense_replace=1)
-    layer = weights.layers[0]
+    state = _layer_state_dict(0, is_moe=False)
+    bdw = BlitzDecodeWeights(submesh)
+    layer = prepare_dense_layer_weights(bdw, state, 0)
     assert isinstance(layer, DeepSeekV3DenseLayerWeights)
     attn = AttentionWeights(
         q_a_proj=layer.q_a_proj,
@@ -395,6 +419,7 @@ def test_incremental_save_load_dense_4x2(bh_2d_mesh_device, tmp_path):
         ffn_norm=layer.ffn_norm,
         kv_b1_proj=layer.kv_b1_proj,
         kv_b2_proj=layer.kv_b2_proj,
+        gate_bias=None,
     )
     shared = SharedExpertWeights(
         shared_gate_proj=layer.shared_gate_proj,
@@ -415,8 +440,8 @@ def test_incremental_save_load_dense_4x2(bh_2d_mesh_device, tmp_path):
     save_shared_expert_weights(shared, tmp_path, 0, is_moe=False, **manifest_kw)
     save_routed_expert_weights(routed, tmp_path, 0, is_moe=False, **manifest_kw)
     expected_routed_shape = layer.routed_gate_proj.shape
-    deallocate_weights(weights)
-    loaded = load_layer(tmp_path, submesh, 0)
+    _deallocate_layer(layer)
+    loaded = load_dense_decoder_layer(tmp_path, submesh, 0)
     assert isinstance(loaded, DeepSeekV3DenseLayerWeights)
     _assert_overlapped_tensors_match(layer.q_a_proj, loaded.q_a_proj)
     _assert_overlapped_tensors_match(layer.shared_gate_proj, loaded.shared_gate_proj)
@@ -430,20 +455,14 @@ def test_incremental_save_load_dense_4x2(bh_2d_mesh_device, tmp_path):
     indirect=True,
 )
 def test_incremental_save_load_moe_4x2(bh_2d_mesh_device, tmp_path):
-    """Save MoE layer on 4x2 via separate save_attention_weights, save_shared_expert_weights, save_routed_expert_weights; load_layer and verify."""
+    """Save MoE layer on 4x2 via separate save_attention_weights, save_shared_expert_weights, save_routed_expert_weights; load_moe_decoder_layer and verify."""
     _skip_unless_4x2_mesh(bh_2d_mesh_device)
     if not is_slow_dispatch():
-        pytest.skip("load_layer requires slow dispatch")
+        pytest.skip("load_moe_decoder_layer requires slow dispatch")
     submesh = bh_2d_mesh_device.create_submesh(ttnn.MeshShape((4, 2)))
-    state = _full_state_dict(1, first_k_dense_replace=0, seed=43)
-    weights = prepare_weights(
-        state,
-        submesh,
-        num_layers=1,
-        first_k_dense_replace=0,
-        num_routed_experts=NUM_ROUTED_EXPERTS,
-    )
-    layer = weights.layers[0]
+    state = _layer_state_dict(0, is_moe=True, seed=43)
+    bdw = BlitzDecodeWeights(submesh)
+    layer = prepare_moe_layer_weights(bdw, state, 0, num_routed_experts=NUM_ROUTED_EXPERTS)
     assert isinstance(layer, DeepSeekV3MoELayerWeights)
     attn = AttentionWeights(
         q_a_proj=layer.q_a_proj,
@@ -478,8 +497,8 @@ def test_incremental_save_load_moe_4x2(bh_2d_mesh_device, tmp_path):
     save_shared_expert_weights(shared, tmp_path, 0, is_moe=True, **manifest_kw)
     save_routed_expert_weights(routed, tmp_path, 0, is_moe=True, **manifest_kw)
     expected_routed_expert_shape = layer.routed_gate_proj[0].shape
-    deallocate_weights(weights)
-    loaded = load_layer(tmp_path, submesh, 0)
+    _deallocate_layer(layer)
+    loaded = load_moe_decoder_layer(tmp_path, submesh, 0)
     assert isinstance(loaded, DeepSeekV3MoELayerWeights)
     _assert_overlapped_tensors_match(layer.gate_mm, loaded.gate_mm)
     assert loaded.gate_bias.shape == layer.gate_bias.shape
@@ -509,6 +528,7 @@ def test_dump_load_routed_expert_weights_4x2(bh_2d_mesh_device, tmp_path):
     _skip_unless_4x2_mesh(bh_2d_mesh_device)
     submesh = bh_2d_mesh_device.create_submesh(ttnn.MeshShape((4, 2)))
 
+    logger.info("Testing dump/load round-trip for MoE routed expert weights on 4x2 mesh...")
     gate_stacked, up_stacked, down_stacked = _moe_routed_expert_stacked_tensors(seed=43)
     bdw = BlitzDecodeWeights(submesh)
     routed_gate_proj, routed_up_proj, routed_down_proj = bdw.get_tt_moe_routed_expert_weights(
@@ -525,6 +545,7 @@ def test_dump_load_routed_expert_weights_4x2(bh_2d_mesh_device, tmp_path):
     experts_dir = layer_dir / "experts"
     experts_dir.mkdir(parents=True, exist_ok=True)
     for e in range(NUM_ROUTED_EXPERTS):
+        logger.info("Dumping expert {}...", e)
         expert_dir = experts_dir / f"e_{e:03d}"
         expert_dir.mkdir(parents=True, exist_ok=True)
         ttnn.dump_tensor(expert_dir / "gate_proj.tensorbin", routed_gate_proj[e])
@@ -540,6 +561,7 @@ def test_dump_load_routed_expert_weights_4x2(bh_2d_mesh_device, tmp_path):
     t0 = time.perf_counter()
     for e in range(NUM_ROUTED_EXPERTS):
         expert_dir = experts_dir / f"e_{e:03d}"
+        logger.info("Loading expert {}...", e)
         routed_gate_proj.append(ttnn.load_tensor(expert_dir / "gate_proj.tensorbin", device=submesh))
         routed_up_proj.append(ttnn.load_tensor(expert_dir / "up_proj.tensorbin", device=submesh))
         routed_down_proj.append(ttnn.load_tensor(expert_dir / "down_proj.tensorbin", device=submesh))
@@ -570,18 +592,12 @@ def test_prepare_dense_layer_single_layer_4x2(bh_2d_mesh_device):
     """Build one dense layer on 4x2 mesh; verify type and shapes (MLA TP=2)."""
     _skip_unless_4x2_mesh(bh_2d_mesh_device)
     submesh = bh_2d_mesh_device.create_submesh(ttnn.MeshShape((4, 2)))
-    state = _full_state_dict(1, first_k_dense_replace=1)
+    state = _layer_state_dict(0, is_moe=False)
+    bdw = BlitzDecodeWeights(submesh)
     t0 = time.perf_counter()
-    weights = prepare_weights(
-        state,
-        submesh,
-        num_layers=1,
-        first_k_dense_replace=1,
-    )
+    layer = prepare_dense_layer_weights(bdw, state, 0)
     elapsed = time.perf_counter() - t0
-    logger.info("prepare_weights (1 dense layer, 4x2 mesh): {:.3f} s", elapsed)
-    assert len(weights.layers) == 1
-    layer = weights.layers[0]
+    logger.info("prepare_dense_layer_weights (1 dense layer, 4x2 mesh): {:.3f} s", elapsed)
     assert isinstance(layer, DeepSeekV3DenseLayerWeights)
     assert layer.q_a_proj.tensor_shape == (3584, 3072)
     assert layer.q_b_proj.tensor_shape == (1536, 12288)
@@ -609,16 +625,15 @@ def test_save_load_dense_layer_single_layer_4x2(bh_2d_mesh_device, tmp_path):
     """Save one dense layer (4x2 submesh) to disk, load it back, assert metadata and fused-tensor sharing."""
     _skip_unless_4x2_mesh(bh_2d_mesh_device)
     if not is_slow_dispatch():
-        pytest.skip("load_layer requires slow dispatch")
+        pytest.skip("load_dense_decoder_layer requires slow dispatch")
     submesh = bh_2d_mesh_device.create_submesh(ttnn.MeshShape((4, 2)))
 
-    state = _full_state_dict(1, first_k_dense_replace=1)
+    state = _layer_state_dict(0, is_moe=False)
+    bdw = BlitzDecodeWeights(submesh)
     t0 = time.perf_counter()
-    weights = prepare_weights(state, submesh, num_layers=1, first_k_dense_replace=1)
+    orig = prepare_dense_layer_weights(bdw, state, 0)
     elapsed = time.perf_counter() - t0
-    logger.info("prepare_weights (1 dense layer, 4x2 mesh): {:.3f} s", elapsed)
-    assert len(weights.layers) == 1
-    orig = weights.layers[0]
+    logger.info("prepare_dense_layer_weights (1 dense layer, 4x2 mesh): {:.3f} s", elapsed)
     assert isinstance(orig, DeepSeekV3DenseLayerWeights)
     assert orig.q_a_proj.tensor_shape == (3584, 3072)
     assert orig.q_b_proj.tensor_shape == (1536, 12288)
@@ -640,7 +655,7 @@ def test_save_load_dense_layer_single_layer_4x2(bh_2d_mesh_device, tmp_path):
     q_ab_kv_a_fused = orig.q_a_proj.fused_tensor
     _ = q_ab_kv_a_fused.shape
     logger.info("Early access: got shape {}", q_ab_kv_a_fused.shape)
-    save_layer(
+    save_decoder_layer(
         orig,
         tmp_path,
         0,
@@ -659,11 +674,11 @@ def test_save_load_dense_layer_single_layer_4x2(bh_2d_mesh_device, tmp_path):
     assert (layer_dir / "routed_up_proj.tensorbin").exists()
     assert (layer_dir / "routed_down_proj.tensorbin").exists()
 
-    deallocate_weights(weights)
+    _deallocate_layer(orig)
     t0 = time.perf_counter()
-    layer = load_layer(tmp_path, submesh, 0)
+    layer = load_dense_decoder_layer(tmp_path, submesh, 0)
     elapsed = time.perf_counter() - t0
-    logger.info("load_layer (dense, 4x2 submesh): {:.3f} s", elapsed)
+    logger.info("load_dense_decoder_layer (dense, 4x2 submesh): {:.3f} s", elapsed)
     assert isinstance(layer, DeepSeekV3DenseLayerWeights)
 
     _assert_overlapped_tensors_match(orig.q_a_proj, layer.q_a_proj)
@@ -699,22 +714,15 @@ def test_prepare_moe_layer_single_layer_4x2(bh_2d_mesh_device):
     """Build one MoE layer on 4x2 mesh; verify type and shapes (MLA TP=2, MoE TP=8)."""
     _skip_unless_4x2_mesh(bh_2d_mesh_device)
     submesh = bh_2d_mesh_device.create_submesh(ttnn.MeshShape((4, 2)))
-    state = _full_state_dict(1, first_k_dense_replace=0, seed=43)
+    state = _layer_state_dict(0, is_moe=True, seed=43)
+    bdw = BlitzDecodeWeights(submesh)
     logger.info(f"State dict prepared")
     t0 = time.perf_counter()
     logger.info(f"Preparing weights...")
-    weights = prepare_weights(
-        state,
-        submesh,
-        num_layers=1,
-        first_k_dense_replace=0,
-        num_routed_experts=NUM_ROUTED_EXPERTS,
-    )
+    layer = prepare_moe_layer_weights(bdw, state, 0, num_routed_experts=NUM_ROUTED_EXPERTS)
     logger.info(f"Weights prepared")
     elapsed = time.perf_counter() - t0
-    logger.info("prepare_weights (1 MoE layer, 4x2 mesh): {:.3f} s", elapsed)
-    assert len(weights.layers) == 1
-    layer = weights.layers[0]
+    logger.info("prepare_moe_layer_weights (1 MoE layer, 4x2 mesh): {:.3f} s", elapsed)
     assert isinstance(layer, DeepSeekV3MoELayerWeights)
     assert layer.q_a_proj.tensor_shape == (3584, 3072)
     assert layer.q_b_proj.tensor_shape == (1536, 12288)
@@ -745,22 +753,15 @@ def test_save_load_moe_layer_single_layer_4x2(bh_2d_mesh_device, tmp_path):
     """Save one MoE layer (4x2 submesh) to disk, load it back, assert metadata and fused-tensor sharing."""
     _skip_unless_4x2_mesh(bh_2d_mesh_device)
     if not is_slow_dispatch():
-        pytest.skip("load_layer requires slow dispatch")
+        pytest.skip("load_moe_decoder_layer requires slow dispatch")
     submesh = bh_2d_mesh_device.create_submesh(ttnn.MeshShape((4, 2)))
 
-    state = _full_state_dict(1, first_k_dense_replace=0, seed=43)
+    state = _layer_state_dict(0, is_moe=True, seed=43)
+    bdw = BlitzDecodeWeights(submesh)
     t0 = time.perf_counter()
-    weights = prepare_weights(
-        state,
-        submesh,
-        num_layers=1,
-        first_k_dense_replace=0,
-        num_routed_experts=NUM_ROUTED_EXPERTS,
-    )
+    orig = prepare_moe_layer_weights(bdw, state, 0, num_routed_experts=NUM_ROUTED_EXPERTS)
     elapsed = time.perf_counter() - t0
-    logger.info("prepare_weights (1 MoE layer, 4x2 mesh): {:.3f} s", elapsed)
-    assert len(weights.layers) == 1
-    orig = weights.layers[0]
+    logger.info("prepare_moe_layer_weights (1 MoE layer, 4x2 mesh): {:.3f} s", elapsed)
     assert isinstance(orig, DeepSeekV3MoELayerWeights)
     assert orig.q_a_proj.tensor_shape == (3584, 3072)
     assert orig.q_b_proj.tensor_shape == (1536, 12288)
@@ -785,7 +786,7 @@ def test_save_load_moe_layer_single_layer_4x2(bh_2d_mesh_device, tmp_path):
     q_ab_kv_a_fused = orig.q_a_proj.fused_tensor
     _ = q_ab_kv_a_fused.shape
     logger.info("Early access: got shape {}", q_ab_kv_a_fused.shape)
-    save_layer(
+    save_decoder_layer(
         orig,
         tmp_path,
         0,
@@ -806,11 +807,11 @@ def test_save_load_moe_layer_single_layer_4x2(bh_2d_mesh_device, tmp_path):
         assert (expert_dir / "up_proj.tensorbin").exists()
         assert (expert_dir / "down_proj.tensorbin").exists()
 
-    deallocate_weights(weights)
+    _deallocate_layer(orig)
     t0 = time.perf_counter()
-    layer = load_layer(tmp_path, submesh, 0)
+    layer = load_moe_decoder_layer(tmp_path, submesh, 0)
     elapsed = time.perf_counter() - t0
-    logger.info("load_layer (moe, 4x2 submesh): {:.3f} s", elapsed)
+    logger.info("load_moe_decoder_layer (moe, 4x2 submesh): {:.3f} s", elapsed)
     assert isinstance(layer, DeepSeekV3MoELayerWeights)
 
     _assert_overlapped_tensors_match(orig.q_a_proj, layer.q_a_proj)
@@ -845,24 +846,18 @@ def test_save_load_moe_layer_single_layer_4x2(bh_2d_mesh_device, tmp_path):
     [{"fabric_config": ttnn.FabricConfig.FABRIC_2D}],
     indirect=True,
 )
-def test_load_layer_with_preloaded_routed_experts_4x2(bh_2d_mesh_device, tmp_path):
-    """Prepare+save an MoE layer, load routed experts via load_moe_routed_experts_from_cache, then load_layer(..., preloaded_routed_experts=...) and verify the assembled layer matches."""
+def test_load_moe_decoder_layer_4x2(bh_2d_mesh_device, tmp_path):
+    """Prepare+save an MoE layer, then load via load_moe_decoder_layer (fast-dispatch for experts is internal) and verify."""
     _skip_unless_4x2_mesh(bh_2d_mesh_device)
     if not is_slow_dispatch():
-        pytest.skip("load_layer requires slow dispatch")
+        pytest.skip("load_moe_decoder_layer requires slow dispatch")
     submesh = bh_2d_mesh_device.create_submesh(ttnn.MeshShape((4, 2)))
 
-    state = _full_state_dict(1, first_k_dense_replace=0, seed=43)
-    weights = prepare_weights(
-        state,
-        submesh,
-        num_layers=1,
-        first_k_dense_replace=0,
-        num_routed_experts=NUM_ROUTED_EXPERTS,
-    )
-    orig = weights.layers[0]
+    state = _layer_state_dict(0, is_moe=True, seed=43)
+    bdw = BlitzDecodeWeights(submesh)
+    orig = prepare_moe_layer_weights(bdw, state, 0, num_routed_experts=NUM_ROUTED_EXPERTS)
     assert isinstance(orig, DeepSeekV3MoELayerWeights)
-    save_layer(
+    save_decoder_layer(
         orig,
         tmp_path,
         0,
@@ -870,18 +865,10 @@ def test_load_layer_with_preloaded_routed_experts_4x2(bh_2d_mesh_device, tmp_pat
         hf_state_dict_name="test-moe-state-dict.safetensors",
         device_mesh_shape=(4, 2),
     )
-    deallocate_weights(weights)
+    _deallocate_layer(orig)
 
-    preloaded = load_moe_routed_experts_from_cache(tmp_path, submesh, 0)
-    assert len(preloaded.routed_gate_proj) == NUM_ROUTED_EXPERTS
-    assert len(preloaded.routed_up_proj) == NUM_ROUTED_EXPERTS
-    assert len(preloaded.routed_down_proj) == NUM_ROUTED_EXPERTS
-
-    layer = load_layer(
-        tmp_path, submesh, 0, preloaded_routed_experts=preloaded
-    )  # This requires slow dispatch, so test must run in this mode
+    layer = load_moe_decoder_layer(tmp_path, submesh, 0)
     assert isinstance(layer, DeepSeekV3MoELayerWeights)
-    # Expected shapes (same as test_prepare_moe_layer_single_layer_4x2)
     assert layer.q_a_proj.tensor_shape == (3584, 3072)
     assert layer.q_b_proj.tensor_shape == (1536, 12288)
     assert layer.kv_a_proj.tensor_shape == (7168, 576)
@@ -894,11 +881,7 @@ def test_load_layer_with_preloaded_routed_experts_4x2(bh_2d_mesh_device, tmp_pat
     assert len(layer.routed_gate_proj) == NUM_ROUTED_EXPERTS
     assert len(layer.routed_up_proj) == NUM_ROUTED_EXPERTS
     assert len(layer.routed_down_proj) == NUM_ROUTED_EXPERTS
-    # Routed experts came from preloaded (same count and on device)
     for e in range(NUM_ROUTED_EXPERTS):
-        assert layer.routed_gate_proj[e].shape == preloaded.routed_gate_proj[e].shape
-        assert layer.routed_up_proj[e].shape == preloaded.routed_up_proj[e].shape
-        assert layer.routed_down_proj[e].shape == preloaded.routed_down_proj[e].shape
         _assert_on_device(layer.routed_gate_proj[e])
         _assert_on_device(layer.routed_up_proj[e])
         _assert_on_device(layer.routed_down_proj[e])
@@ -911,14 +894,14 @@ def test_load_layer_with_preloaded_routed_experts_4x2(bh_2d_mesh_device, tmp_pat
     indirect=True,
 )
 def test_prepare_embedding_weights_4x2(bh_2d_mesh_device):
-    """Prepare embedding weights on 4x2 mesh; verify shape."""
+    """Prepare embedding weights on 4x2 mesh; verify shape. Tensors stay on host until load_embedding_weights."""
     _skip_unless_4x2_mesh(bh_2d_mesh_device)
     submesh = bh_2d_mesh_device.create_submesh(ttnn.MeshShape((4, 2)))
-    state = _full_state_dict(1, first_k_dense_replace=1)
+    state = {}
+    _add_global_weights(state)
     weights = prepare_embedding_weights(state, submesh)
     assert isinstance(weights, DeepSeekV3EmbeddingLayerWeights)
     assert weights.embedding.shape is not None
-    _assert_on_device(weights.embedding)
 
 
 @pytest.mark.parametrize(
@@ -927,16 +910,15 @@ def test_prepare_embedding_weights_4x2(bh_2d_mesh_device):
     indirect=True,
 )
 def test_prepare_lm_head_weights_4x2(bh_2d_mesh_device):
-    """Prepare LM head and final norm weights on 4x2 mesh; verify shapes."""
+    """Prepare LM head and final norm weights on 4x2 mesh; verify shapes. Tensors stay on host until load_lm_head_weights."""
     _skip_unless_4x2_mesh(bh_2d_mesh_device)
     submesh = bh_2d_mesh_device.create_submesh(ttnn.MeshShape((4, 2)))
-    state = _full_state_dict(1, first_k_dense_replace=1)
+    state = {}
+    _add_global_weights(state)
     weights = prepare_lm_head_weights(state, submesh)
     assert isinstance(weights, DeepSeekV3LMHeadWeights)
     assert weights.lm_head.shape is not None
     assert weights.final_norm.shape is not None
-    _assert_on_device(weights.lm_head)
-    _assert_on_device(weights.final_norm)
 
 
 @pytest.mark.parametrize(
@@ -950,21 +932,30 @@ def test_save_load_embedding_and_lm_head_weights_4x2(bh_2d_mesh_device, tmp_path
     if not is_slow_dispatch():
         pytest.skip("load requires slow dispatch")
     submesh = bh_2d_mesh_device.create_submesh(ttnn.MeshShape((4, 2)))
-    state = _full_state_dict(1, first_k_dense_replace=1)
+    state = {}
+    _add_global_weights(state)
+    logger.info("Preparing embedding weights...")
     embedding_weights = prepare_embedding_weights(state, submesh)
+    logger.info("Preparing LM head weights...")
     lm_head_weights = prepare_lm_head_weights(state, submesh)
     expected_embedding_shape = embedding_weights.embedding.shape
     expected_lm_shape = lm_head_weights.lm_head.shape
     expected_norm_shape = lm_head_weights.final_norm.shape
 
+    logger.info("Saving embedding...")
     save_embedding_weights(embedding_weights, tmp_path, hf_model_name="test", hf_state_dict_name="test.safetensors")
+    logger.info("Saving LM head weights...")
     save_lm_head_weights(lm_head_weights, tmp_path, hf_model_name="test", hf_state_dict_name="test.safetensors")
-    deallocate_weights(DeepSeekV3Weights(embedding=embedding_weights, layers=[], lm_head=lm_head_weights))
+    ttnn.deallocate(embedding_weights.embedding, force=True)
+    ttnn.deallocate(lm_head_weights.lm_head, force=True)
+    ttnn.deallocate(lm_head_weights.final_norm, force=True)
 
+    logger.info("Loading embedding weights...")
     loaded_embedding = load_embedding_weights(tmp_path, submesh)
     assert loaded_embedding.embedding.shape == expected_embedding_shape
     _assert_on_device(loaded_embedding.embedding)
 
+    logger.info("Loading LM head weights...")
     loaded_lm_head = load_lm_head_weights(tmp_path, submesh)
     assert loaded_lm_head.lm_head.shape == expected_lm_shape
     assert loaded_lm_head.final_norm.shape == expected_norm_shape
@@ -985,7 +976,7 @@ def test_load_4_layers_across_4_submeshes_4x2(bh_2d_mesh_device, tmp_path):
     Each layer is prepared on its own submesh to avoid OOM. Layers 0,1,2 are dense, layer 3 is MoE.
     """
     if not is_slow_dispatch():
-        pytest.skip("load_layer requires slow dispatch")
+        pytest.skip("load_dense_decoder_layer/load_moe_decoder_layer require slow dispatch")
     num_submeshes = 4
     devices_per_submesh = 4 * 2
     num_devices_required = num_submeshes * devices_per_submesh  # 32
@@ -996,58 +987,49 @@ def test_load_4_layers_across_4_submeshes_4x2(bh_2d_mesh_device, tmp_path):
         )
     submeshes = bh_2d_mesh_device.create_submeshes(ttnn.MeshShape((4, 2)))
     assert len(submeshes) >= num_submeshes, f"Expected at least {num_submeshes} submeshes"
-    submesh0 = submeshes[0]
 
     num_layers = 4
     first_k_dense_replace = 3  # layers 0,1,2 dense; layer 3 MoE
     for layer_idx in range(num_layers):
         is_moe = layer_idx >= first_k_dense_replace
         submesh = submeshes[layer_idx]
-        state = _layer_state_dict(
-            layer_idx,
-            is_moe=is_moe,
-            seed=42 + layer_idx,
-        )
-        # prepare_weights always looks up model.layers.0.* when num_layers=1; remap keys
-        state_for_prepare = {k.replace(f"model.layers.{layer_idx}.", "model.layers.0."): v for k, v in state.items()}
-        _add_global_weights(state_for_prepare, seed=42 + layer_idx)
-        # first_k_dense_replace so the single layer (index 0) is dense or MoE
-        first_k = 1 if layer_idx < first_k_dense_replace else 0
+        bdw = BlitzDecodeWeights(submesh)
+        # State for "layer 0" (prepare_*_layer_weights take layer_idx for key lookup)
+        state = _layer_state_dict(0, is_moe=is_moe, seed=42 + layer_idx)
         t0 = time.perf_counter()
-        weights = prepare_weights(
-            state_for_prepare,
-            submesh,
-            num_layers=1,
-            first_k_dense_replace=first_k,
-            num_routed_experts=NUM_ROUTED_EXPERTS,
-        )
+        if is_moe:
+            layer = prepare_moe_layer_weights(bdw, state, 0, num_routed_experts=NUM_ROUTED_EXPERTS)
+        else:
+            layer = prepare_dense_layer_weights(bdw, state, 0)
         elapsed = time.perf_counter() - t0
         logger.info(
-            "prepare_weights (layer %d, %s, on submesh %d): {:.3f} s",
+            "prepare (layer %d, %s, on submesh %d): {:.3f} s",
             layer_idx,
             "moe" if is_moe else "dense",
             layer_idx,
             elapsed,
         )
-        assert len(weights.layers) == 1
-        save_layer(
-            weights.layers[0],
+        save_decoder_layer(
+            layer,
             tmp_path,
             layer_idx,
             hf_model_name="test-4layer-model",
             hf_state_dict_name="test-4layer-state-dict.safetensors",
             device_mesh_shape=(4, 2),
         )
-        deallocate_weights(weights)
+        _deallocate_layer(layer)
 
     loaded = []
     t0 = time.time()
     for layer_idx in range(num_layers):
         submesh = submeshes[layer_idx]
-        layer = load_layer(tmp_path, submesh, layer_idx)
+        if layer_idx >= first_k_dense_replace:
+            layer = load_moe_decoder_layer(tmp_path, submesh, layer_idx)
+        else:
+            layer = load_dense_decoder_layer(tmp_path, submesh, layer_idx)
         loaded.append(layer)
     elapsed = time.time() - t0
-    logger.info(f"load_layer (4 layers, 4x2 submesh): {elapsed:.3f} s")
+    logger.info("load_decoder_layer (4 layers, 4x2 submesh): %s s", elapsed)
 
     assert isinstance(loaded[0], DeepSeekV3DenseLayerWeights)
     assert isinstance(loaded[1], DeepSeekV3DenseLayerWeights)

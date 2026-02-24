@@ -20,12 +20,15 @@ from models.common.utility_functions import is_slow_dispatch
 from models.demos.deepseek_v3_b1.demo.runner import GenerationResult, run_generation
 from models.demos.deepseek_v3_b1.demo.runtime import TokenCodec, create_model
 from models.demos.deepseek_v3_b1.prepare_weights import (
-    DeepSeekV3LayerWeights,
-    MoERoutedExpertWeights,
+    DeepSeekV3DenseLayerWeights,
+    DeepSeekV3EmbeddingLayerWeights,
+    DeepSeekV3LMHeadWeights,
+    DeepSeekV3MoELayerWeights,
+    load_dense_decoder_layer,
     load_embedding_weights,
-    load_layer,
     load_lm_head_weights,
-    load_moe_routed_experts_from_cache,
+    load_moe_decoder_layer,
+    load_moe_routed_experts,
 )
 
 DEFAULT_TOKENIZER = "deepseek-ai/DeepSeek-V3"
@@ -67,8 +70,10 @@ def load_weights_from_cache(
     cache_path: Path,
     mesh_device: ttnn.MeshDevice,
     layer_offset: int,
-) -> DeepSeekV3LayerWeights:
-    """Load weights from cache: routed experts in fast-dispatch phase, then all layers on their submesh."""
+) -> (
+    DeepSeekV3EmbeddingLayerWeights | DeepSeekV3DenseLayerWeights | DeepSeekV3MoELayerWeights | DeepSeekV3LMHeadWeights
+):
+    """Load weights from cache (embedding, decoder layer, or lm_head)."""
     mesh_id = mesh_device.get_system_mesh_id() + layer_offset
     assert (
         mesh_id >= SYSTEM_MESH_ID_EMBEDDING and mesh_id <= SYSTEM_MESH_ID_LM_HEAD
@@ -80,26 +85,14 @@ def load_weights_from_cache(
         logger.info("Loading LM head weights from cache")
         return load_lm_head_weights(cache_path, mesh_device)
     else:
-        # Get the correct layer ID given the mesh ID
         layer_id = decoder_layer_id_from_mesh_id(mesh_id)
-
         is_moe = layer_id >= FIRST_K_DENSE_REPLACE
         logger.info(f"Loading {'moe' if is_moe else 'dense'} layer weights from cache")
-
-        preloaded_experts: MoERoutedExpertWeights | None = None
         if is_moe:
-            # Phase 1: Fast dispatch -- load routed experts for MoE layers (each on its submesh)
             with ttnn.device.setup_fast_dispatch(mesh_device):
-                preloaded_experts = load_moe_routed_experts_from_cache(cache_path, mesh_device, layer_id)
-
-        # Phase 2: Slow dispatch -- load each layer onto its (4, 2) submesh
-        layer = load_layer(
-            cache_path,
-            mesh_device,
-            layer_id,
-            preloaded_routed_experts=preloaded_experts,
-        )
-        return layer
+                preloaded_experts = load_moe_routed_experts(cache_path, mesh_device, layer_id)
+            return load_moe_decoder_layer(cache_path, mesh_device, layer_id, preloaded_routed_experts=preloaded_experts)
+        return load_dense_decoder_layer(cache_path, mesh_device, layer_id)
 
 
 def create_parser() -> argparse.ArgumentParser:

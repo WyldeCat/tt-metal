@@ -8,6 +8,7 @@ import pytest
 
 import ttnn
 from models.common.utility_functions import is_slow_dispatch
+from models.demos.deepseek_v3_b1.blitz_decode_weights import BlitzDecodeWeights
 from models.demos.deepseek_v3_b1.demo.cli import (
     FIRST_K_DENSE_REPLACE,
     SYSTEM_MESH_ID_EMBEDDING,
@@ -20,15 +21,19 @@ from models.demos.deepseek_v3_b1.prepare_weights import (
     DeepSeekV3EmbeddingLayerWeights,
     DeepSeekV3LMHeadWeights,
     DeepSeekV3MoELayerWeights,
-    deallocate_weights,
-    prepare_weights,
+    prepare_dense_layer_weights,
+    prepare_embedding_weights,
+    prepare_lm_head_weights,
+    prepare_moe_layer_weights,
+    save_decoder_layer,
     save_embedding_weights,
-    save_layer,
     save_lm_head_weights,
 )
 from models.demos.deepseek_v3_b1.tests.unit_tests.test_prepare_weights import (
     NUM_ROUTED_EXPERTS,
-    _full_state_dict,
+    _add_global_weights,
+    _deallocate_layer,
+    _layer_state_dict,
     _skip_unless_4x2_mesh,
 )
 
@@ -183,27 +188,27 @@ def test_load_weights_from_cache(bh_2d_mesh_device, tmp_path, layer_offset):
     )
 
     if layer_offset == SYSTEM_MESH_ID_EMBEDDING or layer_offset == SYSTEM_MESH_ID_LM_HEAD:
-        state = _full_state_dict(1, first_k_dense_replace=1)
-        weights = prepare_weights(state, submesh, num_layers=1, first_k_dense_replace=1)
-        save_embedding_weights(weights.embedding, tmp_path, **manifest_kw)
-        save_lm_head_weights(weights.lm_head, tmp_path, **manifest_kw)
-        deallocate_weights(weights)
+        state = {}
+        _add_global_weights(state)
+        embedding_weights = prepare_embedding_weights(state, submesh)
+        lm_head_weights = prepare_lm_head_weights(state, submesh)
+        save_embedding_weights(embedding_weights, tmp_path, **manifest_kw)
+        save_lm_head_weights(lm_head_weights, tmp_path, **manifest_kw)
+        ttnn.deallocate(embedding_weights.embedding, force=True)
+        ttnn.deallocate(lm_head_weights.lm_head, force=True)
+        ttnn.deallocate(lm_head_weights.final_norm, force=True)
     elif layer_offset == FIRST_K_DENSE_REPLACE - 1:
-        state = _full_state_dict(1, first_k_dense_replace=1)
-        weights = prepare_weights(state, submesh, num_layers=1, first_k_dense_replace=1)
-        save_layer(weights.layers[0], tmp_path, 1, **manifest_kw)
-        deallocate_weights(weights)
+        state = _layer_state_dict(0, is_moe=False)
+        bdw = BlitzDecodeWeights(submesh)
+        layer = prepare_dense_layer_weights(bdw, state, 0)
+        save_decoder_layer(layer, tmp_path, 1, **manifest_kw)
+        _deallocate_layer(layer)
     elif layer_offset == FIRST_K_DENSE_REPLACE:
-        state = _full_state_dict(1, first_k_dense_replace=0, seed=43)
-        weights = prepare_weights(
-            state,
-            submesh,
-            num_layers=1,
-            first_k_dense_replace=0,
-            num_routed_experts=NUM_ROUTED_EXPERTS,
-        )
-        save_layer(weights.layers[0], tmp_path, 2, **manifest_kw)
-        deallocate_weights(weights)
+        state = _layer_state_dict(0, is_moe=True, seed=43)
+        bdw = BlitzDecodeWeights(submesh)
+        layer = prepare_moe_layer_weights(bdw, state, 0, num_routed_experts=NUM_ROUTED_EXPERTS)
+        save_decoder_layer(layer, tmp_path, 2, **manifest_kw)
+        _deallocate_layer(layer)
 
     result = load_weights_from_cache(tmp_path, submesh, layer_offset)
 

@@ -38,13 +38,14 @@ from models.demos.deepseek_v3_b1.prepare_weights import (
     NUM_ROUTED_EXPERTS,
     DeepSeekV3DenseLayerWeights,
     DeepSeekV3MoELayerWeights,
-    load_layer,
+    load_dense_decoder_layer,
+    load_moe_decoder_layer,
     prepare_attention_weights,
-    prepare_dense_decoder_layer_weights,
+    prepare_dense_layer_weights,
     prepare_routed_expert_weights,
     prepare_shared_expert_weights,
     save_attention_weights,
-    save_layer,
+    save_decoder_layer,
     save_routed_expert_weights,
     save_shared_expert_weights,
 )
@@ -440,7 +441,11 @@ def _verify_cache(output_path: Path, layer_num: int, mode: str) -> bool:
         try:
             with bh_2d_mesh_device_context(device_params) as mesh_device:
                 submesh = mesh_device.create_submesh(ttnn.MeshShape(*DEVICE_MESH_SHAPE))
-                loaded = load_layer(output_path, submesh, layer_num)
+                layer_type = manifest.get("layer_type")
+                if layer_type == "dense":
+                    loaded = load_dense_decoder_layer(output_path, submesh, layer_num)
+                else:
+                    loaded = load_moe_decoder_layer(output_path, submesh, layer_num)
             if manifest.get("layer_type") == "dense":
                 if not isinstance(loaded, DeepSeekV3DenseLayerWeights):
                     logger.error("Expected DeepSeekV3DenseLayerWeights, got {}", type(loaded).__name__)
@@ -534,11 +539,11 @@ def main() -> int:
             if mode == "dense":
                 logger.info("Preparing dense decoder layer weights...")
                 t0 = time.perf_counter()
-                layer = prepare_dense_decoder_layer_weights(bdw, state_dict, layer_num)
-                logger.info("prepare_dense_decoder_layer_weights took {:.3f}s", time.perf_counter() - t0)
+                layer = prepare_dense_layer_weights(bdw, state_dict, layer_num)
+                logger.info("prepare_dense_layer_weights took {:.3f}s", time.perf_counter() - t0)
                 logger.info("Saving dense layer to disk...")
                 t0 = time.perf_counter()
-                save_layer(
+                save_decoder_layer(
                     layer,
                     output_path,
                     layer_num,
@@ -546,7 +551,7 @@ def main() -> int:
                     hf_state_dict_name=manifest_kw["hf_state_dict_name"],
                     device_mesh_shape=manifest_kw["device_mesh_shape"],
                 )
-                logger.info("save_layer took {:.3f}s", time.perf_counter() - t0)
+                logger.info("save_decoder_layer took {:.3f}s", time.perf_counter() - t0)
             elif mode == "moe":
                 logger.info("Preparing attention weights (MoE)...")
                 t0 = time.perf_counter()

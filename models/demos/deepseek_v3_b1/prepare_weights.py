@@ -9,7 +9,7 @@ Takes full HuggingFace state dict tensors (full logical shapes for the target
 mesh), applies key mapping, transpose, and kv_b split, then passes to
 BlitzDecodeWeights which fuses and shards onto the mesh.
 
-Supports save_weights / load_weights for offline preparation and runtime load.
+Supports per-layer save/load (save_decoder_layer, load_dense_decoder_layer, load_moe_decoder_layer) and embedding/lm_head save/load for offline preparation and runtime load.
 """
 
 from __future__ import annotations
@@ -186,20 +186,6 @@ class DeepSeekV3LMHeadWeights:
     final_norm: ttnn.Tensor  # model.norm.weight, (1, 7168)
 
 
-DeepSeekV3LayerWeights = (
-    DeepSeekV3DenseLayerWeights | DeepSeekV3MoELayerWeights | DeepSeekV3EmbeddingLayerWeights | DeepSeekV3LMHeadWeights
-)
-
-
-@dataclass
-class DeepSeekV3Weights:
-    """Container for all prepared (fused) weights: embedding, layers, lm_head."""
-
-    embedding: DeepSeekV3EmbeddingLayerWeights
-    layers: list[DeepSeekV3LayerWeights]
-    lm_head: DeepSeekV3LMHeadWeights
-
-
 # Constants for kv_b_proj split (HF stores one matrix; we split into kv_b1 and kv_b2).
 _NUM_HEADS = 64
 # MoE routed experts (DeepSeek V3 config: n_routed_experts=256).
@@ -264,7 +250,7 @@ def _get_layer_raw_tensors(
         norms         | input_layernorm, q_a_layernorm, etc. | (7168,), …    | unsqueeze(0)| (1, 7168), …
 
     MoE-only (gate_mm, shared_gate_proj, shared_up_proj) are read in
-    prepare_moe_decoder_layer_weights.
+    prepare_moe_layer_weights.
 
     Returns:
         (q_a, q_b, kv_a, kv_b1, kv_b2, o_proj, attn_norm, q_norm, kv_norm, ffn_norm).
@@ -444,7 +430,7 @@ def prepare_routed_expert_weights(
         )
 
 
-def prepare_dense_decoder_layer_weights(
+def prepare_dense_layer_weights(
     bdw: BlitzDecodeWeights,
     state_dict: dict[str, torch.Tensor],
     layer_idx: int,
@@ -477,7 +463,7 @@ def prepare_dense_decoder_layer_weights(
     logger.info("  dense layer {} done in {:.3f}s", layer_idx, time.perf_counter() - t0)
 
 
-def prepare_moe_decoder_layer_weights(
+def prepare_moe_layer_weights(
     bdw: BlitzDecodeWeights,
     state_dict: dict[str, torch.Tensor],
     layer_idx: int,
@@ -530,7 +516,7 @@ def prepare_embedding_weights(
         w.contiguous(),
         dtype=ttnn.bfloat16,
         layout=ttnn.TILE_LAYOUT,
-        device=device,
+        device=None,
         memory_config=ttnn.DRAM_MEMORY_CONFIG,
     )
     return DeepSeekV3EmbeddingLayerWeights(embedding=embedding_tt)
@@ -548,7 +534,9 @@ def save_embedding_weights(
     path = Path(path)
     emb_dir = path / "embedding"
     emb_dir.mkdir(parents=True, exist_ok=True)
+    logger.info("Dump embedding weights...")
     ttnn.dump_tensor(emb_dir / "embedding.tensorbin", weights.embedding)
+    logger.info("Dump manifest...")
     manifest = {
         "version": _MANIFEST_VERSION,
         "hf_model_name": hf_model_name,
@@ -574,7 +562,7 @@ def prepare_lm_head_weights(
     device,
 ) -> DeepSeekV3LMHeadWeights:
     """Prepare LM head and final norm weights from state dict."""
-    logger.info("Preparing LM head and final norm weights...")
+    logger.info("Preparing LM head weights...")
     # lm_head.weight: HF (vocab_size, hidden_size) = (129280, 7168) -> (7168, 129280) for matmul
     lm_w = state_dict["lm_head.weight"]
     assert lm_w.shape == (129280, 7168), f"Expected lm_head shape (129280, 7168), got {lm_w.shape}"
@@ -582,17 +570,18 @@ def prepare_lm_head_weights(
         lm_w.T.contiguous(),
         dtype=ttnn.bfloat16,
         layout=ttnn.TILE_LAYOUT,
-        device=device,
+        device=None,  # no device needed for LM head preprocessing
         memory_config=ttnn.DRAM_MEMORY_CONFIG,
     )
+    logger.info("Preparing final norm weights...")
     # model.norm.weight: (7168,) -> (1, 7168)
     norm_w = state_dict["model.norm.weight"]
     assert norm_w.shape == (7168,), f"Expected final norm shape (7168,), got {norm_w.shape}"
     final_norm_tt = ttnn.from_torch(
         norm_w.unsqueeze(0).contiguous(),
         dtype=ttnn.bfloat16,
-        layout=ttnn.TILE_LAYOUT,
-        device=device,
+        layout=ttnn.ROW_MAJOR_LAYOUT,
+        device=None,  # no device needed for final norm preprocessing
         memory_config=ttnn.DRAM_MEMORY_CONFIG,
     )
     return DeepSeekV3LMHeadWeights(lm_head=lm_head_tt, final_norm=final_norm_tt)
@@ -631,93 +620,6 @@ def load_lm_head_weights(path: str | Path, device) -> DeepSeekV3LMHeadWeights:
     lm_head = ttnn.load_tensor(lm_dir / "lm_head.tensorbin", device=device)
     final_norm = ttnn.load_tensor(lm_dir / "final_norm.tensorbin", device=device)
     return DeepSeekV3LMHeadWeights(lm_head=lm_head, final_norm=final_norm)
-
-
-def prepare_weights(
-    state_dict: dict[str, torch.Tensor],
-    device,
-    num_layers: int = 61,
-    first_k_dense_replace: int = 3,
-    num_routed_experts: int = NUM_ROUTED_EXPERTS,
-) -> DeepSeekV3Weights:
-    """Build fused weights from a HuggingFace-style state dict.
-
-    State dict should use full logical HF shapes when device is a mesh (e.g. 4x2);
-    internally we shard them across the mesh.
-
-    Args:
-        state_dict: Weights keyed by model.layers.{i}.self_attn.*, model.layers.{i}.mlp.*, etc.
-        device: MeshDevice to place weights on.
-        num_layers: Total number of layers (default 61).
-        first_k_dense_replace: Number of dense layers before MoE (default 3).
-        num_routed_experts: Number of MoE routed experts per layer (default NUM_ROUTED_EXPERTS).
-
-    Returns:
-        DeepSeekV3Weights with one entry per layer; dense vs MoE type by layer index.
-    """
-    logger.info(
-        "Preparing full model weights ({} layers, dense 0..{}, MoE {}..{})...",
-        num_layers,
-        first_k_dense_replace - 1,
-        first_k_dense_replace,
-        num_layers - 1,
-    )
-    total_t0 = time.perf_counter()
-    embedding = prepare_embedding_weights(state_dict, device)
-    bdw = BlitzDecodeWeights(device)
-    layers: list[DeepSeekV3LayerWeights] = []
-
-    for i in range(num_layers):
-        is_moe = i >= first_k_dense_replace
-        if is_moe:
-            layers.append(prepare_moe_decoder_layer_weights(bdw, state_dict, i, num_routed_experts=num_routed_experts))
-        else:
-            layers.append(prepare_dense_decoder_layer_weights(bdw, state_dict, i))
-
-    lm_head = prepare_lm_head_weights(state_dict, device)
-    logger.info("All {} layers prepared in {:.3f}s", num_layers, time.perf_counter() - total_t0)
-    return DeepSeekV3Weights(embedding=embedding, layers=layers, lm_head=lm_head)
-
-
-def _deallocate_tt_tensor(t: ttnn.Tensor, seen: set[int]) -> None:
-    """Deallocate a single ttnn.Tensor if not already deallocated (by id)."""
-    fid = id(t)
-    if fid not in seen:
-        seen.add(fid)
-        ttnn.deallocate(t, force=True)
-
-
-def deallocate_weights(weights: DeepSeekV3Weights) -> None:
-    """Release device memory for all fused tensors in prepared weights.
-
-    Call this before loading a new set of weights onto the same device to avoid
-    OOM (the original and loaded weights would otherwise both reside on device).
-    """
-    seen: set[int] = set()
-    _deallocate_tt_tensor(weights.embedding.embedding, seen)
-    _deallocate_tt_tensor(weights.lm_head.lm_head, seen)
-    _deallocate_tt_tensor(weights.lm_head.final_norm, seen)
-    for layer in weights.layers:
-        for _name, ot in _layer_overlapped_tensor_fields(layer):
-            fid = id(ot.fused_tensor)
-            if fid not in seen:
-                seen.add(fid)
-                ttnn.deallocate(ot.fused_tensor, force=True)
-        if hasattr(layer, "shared_down_proj"):
-            _deallocate_tt_tensor(getattr(layer, "shared_down_proj"), seen)
-        if isinstance(layer, DeepSeekV3MoELayerWeights):
-            _deallocate_tt_tensor(layer.gate_bias, seen)
-            for t in layer.routed_gate_proj:
-                _deallocate_tt_tensor(t, seen)
-            for t in layer.routed_up_proj:
-                _deallocate_tt_tensor(t, seen)
-            for t in layer.routed_down_proj:
-                _deallocate_tt_tensor(t, seen)
-        else:
-            assert isinstance(layer, DeepSeekV3DenseLayerWeights)
-            _deallocate_tt_tensor(layer.routed_gate_proj, seen)
-            _deallocate_tt_tensor(layer.routed_up_proj, seen)
-            _deallocate_tt_tensor(layer.routed_down_proj, seen)
 
 
 def _core_range_set_to_list(crs: ttnn.CoreRangeSet) -> list[list[list[int]]]:
@@ -776,7 +678,7 @@ def _overlapped_tensor_from_dict(
 
 
 def _layer_overlapped_tensor_fields(
-    layer: DeepSeekV3LayerWeights,
+    layer: DeepSeekV3DenseLayerWeights | DeepSeekV3MoELayerWeights,
 ) -> list[tuple[str, OverlappedTensor]]:
     """Return (field_name, OverlappedTensor) for every OverlappedTensor field on the layer."""
     out = []
@@ -989,8 +891,8 @@ def save_routed_expert_weights(
         json.dump(manifest, f, indent=2)
 
 
-def save_layer(
-    layer: DeepSeekV3LayerWeights,
+def save_decoder_layer(
+    layer: DeepSeekV3DenseLayerWeights | DeepSeekV3MoELayerWeights,
     path: str | Path,
     layer_idx: int,
     *,
@@ -1007,7 +909,7 @@ def save_layer(
     layer_dir = path / f"layer_{layer_idx:03d}"
     logger.info(f"Saving layer {layer_idx} to {layer_dir}...")
     is_moe = isinstance(layer, DeepSeekV3MoELayerWeights)
-    save_layer_t0 = time.perf_counter()
+    save_decoder_layer_t0 = time.perf_counter()
     attn = AttentionWeights(
         q_a_proj=layer.q_a_proj,
         q_b_proj=layer.q_b_proj,
@@ -1066,20 +968,23 @@ def save_layer(
         hf_state_dict_name=hf_state_dict_name,
         device_mesh_shape=device_mesh_shape,
     )
-    logger.info(f"  save_layer total: {time.perf_counter() - save_layer_t0:.3f}s")
+    logger.info(f"  save_decoder_layer total: {time.perf_counter() - save_decoder_layer_t0:.3f}s")
 
 
-def load_moe_routed_experts_from_cache(
+def load_moe_routed_experts(
     path: str | Path,
     device,
     layer_idx: int,
     *,
     num_experts: int = NUM_ROUTED_EXPERTS,
 ) -> MoERoutedExpertWeights:
-    """Load only the routed expert weights for an MoE layer from cache (fast-dispatch-safe).
+    """Load only the routed expert weights for an MoE layer from cache.
 
-    Reads experts/e_NNN/{gate,up,down}_proj.tensorbin. Use this in fast dispatch mode
-    before loading the rest of the layer in slow dispatch via load_layer(..., preloaded_routed_experts=...).
+    Reads experts/e_NNN/{gate,up,down}_proj.tensorbin. Since setup_fast_dispatch can
+    only be used once per program, call this under setup_fast_dispatch and pass the
+    result to load_moe_decoder_layer(..., preloaded_routed_experts=...). If you do
+    not use fast dispatch, omit preloaded_routed_experts and load_moe_decoder_layer
+    will load experts from disk in the current dispatch mode.
     """
     path = Path(path)
     layer_dir = path / f"layer_{layer_idx:03d}"
@@ -1124,17 +1029,95 @@ def load_moe_routed_experts_from_cache(
     )
 
 
-def load_layer(
+def load_dense_decoder_layer(
+    path: str | Path,
+    device,
+    layer_idx: int,
+) -> DeepSeekV3DenseLayerWeights:
+    """Deserialize a dense decoder layer from <path>/layer_{layer_idx:03d}/."""
+    path = Path(path)
+    layer_dir = path / f"layer_{layer_idx:03d}"
+    manifest_path = layer_dir / "manifest.json"
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"Missing manifest: {manifest_path}")
+
+    with open(manifest_path) as f:
+        manifest = json.load(f)
+
+    if manifest.get("version", 0) > _MANIFEST_VERSION:
+        raise ValueError(f"Unsupported manifest version: {manifest.get('version')}")
+
+    if manifest.get("layer_type") != "dense":
+        raise ValueError(f"Layer {layer_idx} is not dense (layer_type={manifest.get('layer_type')})")
+
+    fusion_groups = manifest["fusion_groups"]
+    load_t0 = time.perf_counter()
+    logger.info("Loading layer {} (dense) from disk...", layer_idx)
+
+    q_ab = fusion_groups["q_ab_kv_a"]
+    fused_q = ttnn.load_tensor(layer_dir / q_ab["tensorbin"], device=device)
+    q_a_proj = _overlapped_tensor_from_dict(fused_q, q_ab["fields"]["q_a_proj"])
+    q_b_proj = _overlapped_tensor_from_dict(fused_q, q_ab["fields"]["q_b_proj"])
+    kv_a_proj = _overlapped_tensor_from_dict(fused_q, q_ab["fields"]["kv_a_proj"])
+
+    o_grp = fusion_groups["o_proj_gate_mm_norms"]
+    fused_o = ttnn.load_tensor(layer_dir / o_grp["tensorbin"], device=device)
+    o_proj = _overlapped_tensor_from_dict(fused_o, o_grp["fields"]["o_proj"])
+    attn_norm = _overlapped_tensor_from_dict(fused_o, o_grp["fields"]["attn_norm"])
+    q_norm = _overlapped_tensor_from_dict(fused_o, o_grp["fields"]["q_norm"])
+    kv_norm = _overlapped_tensor_from_dict(fused_o, o_grp["fields"]["kv_norm"])
+    ffn_norm = _overlapped_tensor_from_dict(fused_o, o_grp["fields"]["ffn_norm"])
+
+    kv_grp = fusion_groups["kv_b12"]
+    fused_kv = ttnn.load_tensor(layer_dir / kv_grp["tensorbin"], device=device)
+    kv_b1_proj = _overlapped_tensor_from_dict(fused_kv, kv_grp["fields"]["kv_b1_proj"])
+    kv_b2_proj = _overlapped_tensor_from_dict(fused_kv, kv_grp["fields"]["kv_b2_proj"])
+
+    gu_grp = fusion_groups["gate_up"]
+    fused_gu = ttnn.load_tensor(layer_dir / gu_grp["tensorbin"], device=device)
+    shared_gate_proj = _overlapped_tensor_from_dict(fused_gu, gu_grp["fields"]["shared_gate_proj"])
+    shared_up_proj = _overlapped_tensor_from_dict(fused_gu, gu_grp["fields"]["shared_up_proj"])
+
+    standalone = manifest.get("standalone_tensors", {})
+    shared_down_proj = ttnn.load_tensor(layer_dir / standalone["shared_down_proj"], device=device)
+    routed_gate_proj = ttnn.load_tensor(layer_dir / standalone["routed_gate_proj"], device=device)
+    routed_up_proj = ttnn.load_tensor(layer_dir / standalone["routed_up_proj"], device=device)
+    routed_down_proj = ttnn.load_tensor(layer_dir / standalone["routed_down_proj"], device=device)
+    logger.info("  layer {} loaded in {:.3f}s", layer_idx, time.perf_counter() - load_t0)
+
+    return DeepSeekV3DenseLayerWeights(
+        q_a_proj=q_a_proj,
+        q_b_proj=q_b_proj,
+        kv_a_proj=kv_a_proj,
+        o_proj=o_proj,
+        attn_norm=attn_norm,
+        q_norm=q_norm,
+        kv_norm=kv_norm,
+        ffn_norm=ffn_norm,
+        kv_b1_proj=kv_b1_proj,
+        kv_b2_proj=kv_b2_proj,
+        shared_gate_proj=shared_gate_proj,
+        shared_up_proj=shared_up_proj,
+        shared_down_proj=shared_down_proj,
+        routed_gate_proj=routed_gate_proj,
+        routed_up_proj=routed_up_proj,
+        routed_down_proj=routed_down_proj,
+    )
+
+
+def load_moe_decoder_layer(
     path: str | Path,
     device,
     layer_idx: int,
     *,
     preloaded_routed_experts: MoERoutedExpertWeights | None = None,
-) -> DeepSeekV3LayerWeights:
-    """Deserialize a single layer from <path>/layer_{layer_idx:03d}/.
+) -> DeepSeekV3MoELayerWeights:
+    """Deserialize an MoE decoder layer from <path>/layer_{layer_idx:03d}/.
 
-    For MoE layers, if preloaded_routed_experts is provided, expert tensors are not
-    loaded from disk (use after load_moe_routed_experts_from_cache in fast dispatch).
+    If preloaded_routed_experts is provided (e.g. from load_moe_routed_experts under
+    setup_fast_dispatch, which can only be used once per program), those experts are
+    used. Otherwise routed experts are loaded from disk in the current dispatch mode.
+    Fusion groups and standalone tensors are always loaded in the current dispatch mode.
     """
     path = Path(path)
     layer_dir = path / f"layer_{layer_idx:03d}"
@@ -1148,189 +1131,66 @@ def load_layer(
     if manifest.get("version", 0) > _MANIFEST_VERSION:
         raise ValueError(f"Unsupported manifest version: {manifest.get('version')}")
 
-    layer_type = manifest["layer_type"]
+    if manifest.get("layer_type") != "moe":
+        raise ValueError(f"Layer {layer_idx} is not MoE (layer_type={manifest.get('layer_type')})")
+
     fusion_groups = manifest["fusion_groups"]
     load_t0 = time.perf_counter()
-    logger.info("Loading layer {} ({}) from disk...", layer_idx, layer_type)
+    logger.info("Loading layer {} (moe) from disk...", layer_idx)
 
-    if layer_type == "dense":
-        q_ab = fusion_groups["q_ab_kv_a"]
-        fused_q = ttnn.load_tensor(layer_dir / q_ab["tensorbin"], device=device)
-        q_a_proj = _overlapped_tensor_from_dict(fused_q, q_ab["fields"]["q_a_proj"])
-        q_b_proj = _overlapped_tensor_from_dict(fused_q, q_ab["fields"]["q_b_proj"])
-        kv_a_proj = _overlapped_tensor_from_dict(fused_q, q_ab["fields"]["kv_a_proj"])
+    if preloaded_routed_experts is None:
+        preloaded_routed_experts = load_moe_routed_experts(path, device, layer_idx)
 
-        o_grp = fusion_groups["o_proj_gate_mm_norms"]
-        fused_o = ttnn.load_tensor(layer_dir / o_grp["tensorbin"], device=device)
-        o_proj = _overlapped_tensor_from_dict(fused_o, o_grp["fields"]["o_proj"])
-        attn_norm = _overlapped_tensor_from_dict(fused_o, o_grp["fields"]["attn_norm"])
-        q_norm = _overlapped_tensor_from_dict(fused_o, o_grp["fields"]["q_norm"])
-        kv_norm = _overlapped_tensor_from_dict(fused_o, o_grp["fields"]["kv_norm"])
-        ffn_norm = _overlapped_tensor_from_dict(fused_o, o_grp["fields"]["ffn_norm"])
+    q_ab = fusion_groups["q_ab_kv_a"]
+    fused_q = ttnn.load_tensor(layer_dir / q_ab["tensorbin"], device=device)
+    q_a_proj = _overlapped_tensor_from_dict(fused_q, q_ab["fields"]["q_a_proj"])
+    q_b_proj = _overlapped_tensor_from_dict(fused_q, q_ab["fields"]["q_b_proj"])
+    kv_a_proj = _overlapped_tensor_from_dict(fused_q, q_ab["fields"]["kv_a_proj"])
 
-        kv_grp = fusion_groups["kv_b12"]
-        fused_kv = ttnn.load_tensor(layer_dir / kv_grp["tensorbin"], device=device)
-        kv_b1_proj = _overlapped_tensor_from_dict(fused_kv, kv_grp["fields"]["kv_b1_proj"])
-        kv_b2_proj = _overlapped_tensor_from_dict(fused_kv, kv_grp["fields"]["kv_b2_proj"])
+    o_grp = fusion_groups["o_proj_gate_mm_norms"]
+    fused_o = ttnn.load_tensor(layer_dir / o_grp["tensorbin"], device=device)
+    o_proj = _overlapped_tensor_from_dict(fused_o, o_grp["fields"]["o_proj"])
+    gate_mm = _overlapped_tensor_from_dict(fused_o, o_grp["fields"]["gate_mm"])
+    attn_norm = _overlapped_tensor_from_dict(fused_o, o_grp["fields"]["attn_norm"])
+    q_norm = _overlapped_tensor_from_dict(fused_o, o_grp["fields"]["q_norm"])
+    kv_norm = _overlapped_tensor_from_dict(fused_o, o_grp["fields"]["kv_norm"])
+    ffn_norm = _overlapped_tensor_from_dict(fused_o, o_grp["fields"]["ffn_norm"])
 
-        gu_grp = fusion_groups["gate_up"]
-        fused_gu = ttnn.load_tensor(layer_dir / gu_grp["tensorbin"], device=device)
-        shared_gate_proj = _overlapped_tensor_from_dict(fused_gu, gu_grp["fields"]["shared_gate_proj"])
-        shared_up_proj = _overlapped_tensor_from_dict(fused_gu, gu_grp["fields"]["shared_up_proj"])
+    kv_grp = fusion_groups["kv_b12"]
+    fused_kv = ttnn.load_tensor(layer_dir / kv_grp["tensorbin"], device=device)
+    kv_b1_proj = _overlapped_tensor_from_dict(fused_kv, kv_grp["fields"]["kv_b1_proj"])
+    kv_b2_proj = _overlapped_tensor_from_dict(fused_kv, kv_grp["fields"]["kv_b2_proj"])
 
-        standalone = manifest.get("standalone_tensors", {})
-        shared_down_proj = ttnn.load_tensor(layer_dir / standalone["shared_down_proj"], device=device)
-        routed_gate_proj = ttnn.load_tensor(layer_dir / standalone["routed_gate_proj"], device=device)
-        routed_up_proj = ttnn.load_tensor(layer_dir / standalone["routed_up_proj"], device=device)
-        routed_down_proj = ttnn.load_tensor(layer_dir / standalone["routed_down_proj"], device=device)
-        logger.info("  layer {} loaded in {:.3f}s", layer_idx, time.perf_counter() - load_t0)
+    gu_grp = fusion_groups["gate_up"]
+    fused_gu = ttnn.load_tensor(layer_dir / gu_grp["tensorbin"], device=device)
+    shared_gate_proj = _overlapped_tensor_from_dict(fused_gu, gu_grp["fields"]["shared_gate_proj"])
+    shared_up_proj = _overlapped_tensor_from_dict(fused_gu, gu_grp["fields"]["shared_up_proj"])
 
-        return DeepSeekV3DenseLayerWeights(
-            q_a_proj=q_a_proj,
-            q_b_proj=q_b_proj,
-            kv_a_proj=kv_a_proj,
-            o_proj=o_proj,
-            attn_norm=attn_norm,
-            q_norm=q_norm,
-            kv_norm=kv_norm,
-            ffn_norm=ffn_norm,
-            kv_b1_proj=kv_b1_proj,
-            kv_b2_proj=kv_b2_proj,
-            shared_gate_proj=shared_gate_proj,
-            shared_up_proj=shared_up_proj,
-            shared_down_proj=shared_down_proj,
-            routed_gate_proj=routed_gate_proj,
-            routed_up_proj=routed_up_proj,
-            routed_down_proj=routed_down_proj,
-        )
-    else:
-        q_ab = fusion_groups["q_ab_kv_a"]
-        fused_q = ttnn.load_tensor(layer_dir / q_ab["tensorbin"], device=device)
-        q_a_proj = _overlapped_tensor_from_dict(fused_q, q_ab["fields"]["q_a_proj"])
-        q_b_proj = _overlapped_tensor_from_dict(fused_q, q_ab["fields"]["q_b_proj"])
-        kv_a_proj = _overlapped_tensor_from_dict(fused_q, q_ab["fields"]["kv_a_proj"])
+    standalone = manifest.get("standalone_tensors", {})
+    shared_down_proj = ttnn.load_tensor(layer_dir / standalone["shared_down_proj"], device=device)
+    gate_bias = ttnn.load_tensor(layer_dir / standalone["gate_bias"], device=device)
+    routed_gate_proj = preloaded_routed_experts.routed_gate_proj
+    routed_up_proj = preloaded_routed_experts.routed_up_proj
+    routed_down_proj = preloaded_routed_experts.routed_down_proj
+    logger.info("  layer {} loaded in {:.3f}s", layer_idx, time.perf_counter() - load_t0)
 
-        o_grp = fusion_groups["o_proj_gate_mm_norms"]
-        fused_o = ttnn.load_tensor(layer_dir / o_grp["tensorbin"], device=device)
-        o_proj = _overlapped_tensor_from_dict(fused_o, o_grp["fields"]["o_proj"])
-        gate_mm = _overlapped_tensor_from_dict(fused_o, o_grp["fields"]["gate_mm"])
-        attn_norm = _overlapped_tensor_from_dict(fused_o, o_grp["fields"]["attn_norm"])
-        q_norm = _overlapped_tensor_from_dict(fused_o, o_grp["fields"]["q_norm"])
-        kv_norm = _overlapped_tensor_from_dict(fused_o, o_grp["fields"]["kv_norm"])
-        ffn_norm = _overlapped_tensor_from_dict(fused_o, o_grp["fields"]["ffn_norm"])
-
-        kv_grp = fusion_groups["kv_b12"]
-        fused_kv = ttnn.load_tensor(layer_dir / kv_grp["tensorbin"], device=device)
-        kv_b1_proj = _overlapped_tensor_from_dict(fused_kv, kv_grp["fields"]["kv_b1_proj"])
-        kv_b2_proj = _overlapped_tensor_from_dict(fused_kv, kv_grp["fields"]["kv_b2_proj"])
-
-        gu_grp = fusion_groups["gate_up"]
-        fused_gu = ttnn.load_tensor(layer_dir / gu_grp["tensorbin"], device=device)
-        shared_gate_proj = _overlapped_tensor_from_dict(fused_gu, gu_grp["fields"]["shared_gate_proj"])
-        shared_up_proj = _overlapped_tensor_from_dict(fused_gu, gu_grp["fields"]["shared_up_proj"])
-
-        standalone = manifest.get("standalone_tensors", {})
-        shared_down_proj = ttnn.load_tensor(layer_dir / standalone["shared_down_proj"], device=device)
-        gate_bias = ttnn.load_tensor(layer_dir / standalone["gate_bias"], device=device)
-        if preloaded_routed_experts is not None:
-            routed_gate_proj = preloaded_routed_experts.routed_gate_proj
-            routed_up_proj = preloaded_routed_experts.routed_up_proj
-            routed_down_proj = preloaded_routed_experts.routed_down_proj
-            logger.info("  layer {} loaded in {:.3f}s", layer_idx, time.perf_counter() - load_t0)
-        else:
-            num_experts = manifest.get("routed_experts", {}).get("num_experts", NUM_ROUTED_EXPERTS)
-            logger.info("  loading {} routed experts from disk (this may be slow)...", num_experts)
-            experts_t0 = time.perf_counter()
-            experts_dir = layer_dir / "experts"
-            routed_gate_proj = []
-            routed_up_proj = []
-            routed_down_proj = []
-            for e in range(num_experts):
-                if e > 0 and e % 64 == 0:
-                    logger.debug("  loaded experts 0..{}", e - 1)
-                expert_dir = experts_dir / f"e_{e:03d}"
-                routed_gate_proj.append(ttnn.load_tensor(expert_dir / "gate_proj.tensorbin", device=device))
-                routed_up_proj.append(ttnn.load_tensor(expert_dir / "up_proj.tensorbin", device=device))
-                routed_down_proj.append(ttnn.load_tensor(expert_dir / "down_proj.tensorbin", device=device))
-            logger.info(
-                "  layer {} loaded in {:.3f}s (routed experts: {:.3f}s)",
-                layer_idx,
-                time.perf_counter() - load_t0,
-                time.perf_counter() - experts_t0,
-            )
-
-        return DeepSeekV3MoELayerWeights(
-            q_a_proj=q_a_proj,
-            q_b_proj=q_b_proj,
-            kv_a_proj=kv_a_proj,
-            o_proj=o_proj,
-            gate_mm=gate_mm,
-            attn_norm=attn_norm,
-            q_norm=q_norm,
-            kv_norm=kv_norm,
-            ffn_norm=ffn_norm,
-            gate_bias=gate_bias,
-            kv_b1_proj=kv_b1_proj,
-            kv_b2_proj=kv_b2_proj,
-            shared_gate_proj=shared_gate_proj,
-            shared_up_proj=shared_up_proj,
-            shared_down_proj=shared_down_proj,
-            routed_gate_proj=routed_gate_proj,
-            routed_up_proj=routed_up_proj,
-            routed_down_proj=routed_down_proj,
-        )
-
-
-def save_weights(
-    weights: DeepSeekV3Weights,
-    path: str | Path,
-    *,
-    hf_model_name: str,
-    hf_state_dict_name: str,
-    device_mesh_shape: tuple[int, int] = (1, 1),
-) -> None:
-    """Serialize embedding, all layers, and lm_head to disk."""
-    path = Path(path)
-    path.mkdir(parents=True, exist_ok=True)
-    manifest_kw = dict(
-        hf_model_name=hf_model_name,
-        hf_state_dict_name=hf_state_dict_name,
-        device_mesh_shape=device_mesh_shape,
+    return DeepSeekV3MoELayerWeights(
+        q_a_proj=q_a_proj,
+        q_b_proj=q_b_proj,
+        kv_a_proj=kv_a_proj,
+        o_proj=o_proj,
+        gate_mm=gate_mm,
+        attn_norm=attn_norm,
+        q_norm=q_norm,
+        kv_norm=kv_norm,
+        ffn_norm=ffn_norm,
+        gate_bias=gate_bias,
+        kv_b1_proj=kv_b1_proj,
+        kv_b2_proj=kv_b2_proj,
+        shared_gate_proj=shared_gate_proj,
+        shared_up_proj=shared_up_proj,
+        shared_down_proj=shared_down_proj,
+        routed_gate_proj=routed_gate_proj,
+        routed_up_proj=routed_up_proj,
+        routed_down_proj=routed_down_proj,
     )
-    logger.info("Saving embedding to {}...", path)
-    save_embedding_weights(weights.embedding, path, **manifest_kw)
-    num_layers = len(weights.layers)
-    logger.info("Saving all {} layers to {}...", num_layers, path)
-    total_t0 = time.perf_counter()
-    for layer_idx, layer in enumerate(weights.layers):
-        save_layer(
-            layer,
-            path,
-            layer_idx,
-            hf_model_name=hf_model_name,
-            hf_state_dict_name=hf_state_dict_name,
-            device_mesh_shape=device_mesh_shape,
-        )
-    logger.info("Saving LM head to {}...", path)
-    save_lm_head_weights(weights.lm_head, path, **manifest_kw)
-    logger.info("All {} layers saved in {:.3f}s", num_layers, time.perf_counter() - total_t0)
-
-
-def load_weights(
-    path: str | Path,
-    device,
-    num_layers: int = 61,
-) -> DeepSeekV3Weights:
-    """Deserialize embedding, layers, and lm_head from disk."""
-    path = Path(path)
-    if not path.is_dir():
-        raise FileNotFoundError(f"Weights path is not a directory: {path}")
-    logger.info("Loading embedding from {}...", path)
-    embedding = load_embedding_weights(path, device)
-    logger.info("Loading all {} layers from {}...", num_layers, path)
-    total_t0 = time.perf_counter()
-    layers = [load_layer(path, device, i) for i in range(num_layers)]
-    logger.info("All {} layers loaded in {:.3f}s", num_layers, time.perf_counter() - total_t0)
-    logger.info("Loading LM head from {}...", path)
-    lm_head = load_lm_head_weights(path, device)
-    return DeepSeekV3Weights(embedding=embedding, layers=layers, lm_head=lm_head)
