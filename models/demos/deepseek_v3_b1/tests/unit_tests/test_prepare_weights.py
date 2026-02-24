@@ -175,6 +175,7 @@ def _assert_layer_on_device_with_topology(
         _assert_topology(layer.routed_down_proj, _PLACEMENTS_SHARD_0_1)
     else:
         assert isinstance(layer, DeepSeekV3MoELayerWeights)
+        _assert_topology(layer.gate_bias, _PLACEMENTS_REPLICATE)
         for e in range(len(layer.routed_gate_proj)):
             _assert_on_device(layer.routed_gate_proj[e])
             _assert_on_device(layer.routed_up_proj[e])
@@ -318,6 +319,8 @@ def test_prepare_attention_weights_moe_4x2(bh_2d_mesh_device):
     attn = prepare_attention_weights(bdw, state, 0, is_moe=True)
     assert attn.gate_mm is not None
     assert attn.gate_mm.tensor_shape == (7168, 256)
+    assert attn.gate_bias is not None
+    assert attn.gate_bias.shape == (16, 16)
     assert attn.q_a_proj.tensor_shape == (3584, 3072)
     assert attn.o_proj.tensor_shape == (8192, 7168)
 
@@ -729,7 +732,7 @@ def test_prepare_moe_layer_single_layer_4x2(bh_2d_mesh_device):
     assert layer.kv_a_proj.tensor_shape == (7168, 576)
     assert layer.o_proj.tensor_shape == (8192, 7168)
     assert layer.gate_mm.tensor_shape == (7168, 256)
-    assert layer.gate_bias.shape is not None
+    assert layer.gate_bias.shape == (16, 16)
     assert layer.attn_norm.tensor_shape == (1, 7168)
     assert layer.q_norm.tensor_shape == (1, 1536)
     assert layer.kv_norm.tensor_shape == (1, 512)
@@ -768,7 +771,7 @@ def test_save_load_moe_layer_single_layer_4x2(bh_2d_mesh_device, tmp_path):
     assert orig.kv_a_proj.tensor_shape == (7168, 576)
     assert orig.o_proj.tensor_shape == (8192, 7168)
     assert orig.gate_mm.tensor_shape == (7168, 256)
-    assert orig.gate_bias.shape is not None
+    assert orig.gate_bias.shape == (16, 16)
     assert orig.attn_norm.tensor_shape == (1, 7168)
     assert orig.q_norm.tensor_shape == (1, 1536)
     assert orig.kv_norm.tensor_shape == (1, 512)
@@ -874,7 +877,7 @@ def test_load_moe_decoder_layer_4x2(bh_2d_mesh_device, tmp_path):
     assert layer.kv_a_proj.tensor_shape == (7168, 576)
     assert layer.o_proj.tensor_shape == (8192, 7168)
     assert layer.gate_mm.tensor_shape == (7168, 256)
-    assert layer.gate_bias.shape is not None
+    assert layer.gate_bias.shape == (16, 16)
     assert layer.attn_norm.tensor_shape == (1, 7168)
     assert layer.shared_gate_proj.tensor_shape == (7168, 256)
     assert layer.shared_up_proj.tensor_shape == (7168, 256)

@@ -36,6 +36,11 @@ _DTYPE_TO_STR = {
 }
 _STR_TO_DTYPE = {v: k for k, v in _DTYPE_TO_STR.items()}
 
+# MoE gate bias: HEIGHT_SHARDED on sender core (10, 9), tile [16, 16]
+_MOE_SENDER_CORE = ttnn.CoreCoord(10, 9)
+_MOE_SENDER_CORE_GRID = ttnn.CoreRangeSet([ttnn.CoreRange(_MOE_SENDER_CORE, _MOE_SENDER_CORE)])
+_GATE_BIAS_TILE = ttnn.Tile([16, 16])
+
 # Fusion group name per field (for grouping by fused_tensor)
 _FIELD_TO_FUSION_GROUP: dict[str, str] = {
     "q_a_proj": "q_ab_kv_a",
@@ -298,12 +303,19 @@ def prepare_attention_weights(
         # e_score_correction_bias: (256,) -> (16, 16) reshape + transpose for MoE op
         gate_bias_raw = state_dict[_key(layer_idx, "mlp.gate.e_score_correction_bias")]
         gate_bias_reshaped = gate_bias_raw.reshape(16, 16).T.contiguous()
+        gate_bias_mem_config = ttnn.MemoryConfig(
+            ttnn.TensorMemoryLayout.HEIGHT_SHARDED,
+            ttnn.BufferType.L1,
+            ttnn.ShardSpec(_MOE_SENDER_CORE_GRID, (16, 16), ttnn.ShardOrientation.ROW_MAJOR),
+        )
         gate_bias_tt = ttnn.from_torch(
             gate_bias_reshaped.to(torch.bfloat16),
             dtype=ttnn.bfloat16,
             layout=ttnn.TILE_LAYOUT,
-            device=bdw._device,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            device=None,
+            memory_config=gate_bias_mem_config,
+            tile=_GATE_BIAS_TILE,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(bdw._device),
         )
         logger.debug("  convert o_proj_gate_mm_norms (MoE): {:.3f}s", time.perf_counter() - t0)
         return AttentionWeights(
