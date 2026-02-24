@@ -6,8 +6,6 @@
 
 #include <tt-metalium/constants.hpp>
 #include "full_like_device_operation.hpp"
-#include <tt-metalium/host_api.hpp>
-#include <tt-metalium/circular_buffer_config.hpp>
 #include <tt-metalium/work_split.hpp>
 #include <tt-metalium/tensor_accessor_args.hpp>
 #include "ttnn/tensor/types.hpp"
@@ -16,7 +14,7 @@ namespace ttnn::operations::full_like {
 
 using namespace tt;
 using namespace tt::constants;
-using namespace tt::tt_metal::detail;
+using namespace tt::tt_metal;
 
 // After the full modification and if there are no issues in the overall tests, it will be added to `bfloat16.hpp` and
 // applied globally.
@@ -45,20 +43,16 @@ union datatype {
     float f32;
 } u;
 
-FullLikeOperation::ProgramFactory::cached_program_t FullLikeOperation::ProgramFactory::create(
+ProgramDescriptor FullLikeOperation::ProgramFactory::create_descriptor(
     const operation_attributes_t& operation_attributes,
     const tensor_args_t& tensor_args,
     tensor_return_value_t& output) {
-    auto input = tensor_args.input;
-    auto fill_value = operation_attributes.fill_value;
-    DataType dtype{operation_attributes.dtype};
+    const auto& input = tensor_args.input;
+    const auto fill_value = operation_attributes.fill_value;
+    const DataType dtype = operation_attributes.dtype;
     IDevice* device = input.device();
-    MemoryConfig memory_config{operation_attributes.memory_config};
 
     auto num_tiles = input.physical_volume() / TILE_HW;
-
-    Program program{};
-
     auto data_format = datatype_to_dataformat_converter(dtype);
     uint32_t single_tile_size = tt::tile_size(data_format);
 
@@ -70,15 +64,11 @@ FullLikeOperation::ProgramFactory::cached_program_t FullLikeOperation::ProgramFa
 
     constexpr CBIndex cb_fill_value_id = CBIndex::c_24;
 
-    auto cb_value_config = tt::tt_metal::CircularBufferConfig(single_tile_size, {{cb_fill_value_id, data_format}})
-                               .set_page_size(cb_fill_value_id, single_tile_size);
-    CreateCircularBuffer(program, all_cores, cb_value_config);
-    std::map<std::string, std::string> writer_defines;
-
+    KernelDescriptor::Defines writer_defines;
     switch (dtype) {
-        case DataType::BFLOAT16: writer_defines["OUTPUT_DTYPE_BFLOAT16"] = "1"; break;
-        case DataType::INT32: writer_defines["OUTPUT_DTYPE_INT32"] = "1"; break;
-        case DataType::FLOAT32: writer_defines["OUTPUT_DTYPE_FLOAT32"] = "1"; break;
+        case DataType::BFLOAT16: writer_defines.emplace_back("OUTPUT_DTYPE_BFLOAT16", "1"); break;
+        case DataType::INT32: writer_defines.emplace_back("OUTPUT_DTYPE_INT32", "1"); break;
+        case DataType::FLOAT32: writer_defines.emplace_back("OUTPUT_DTYPE_FLOAT32", "1"); break;
         default: break;
     }
 
@@ -93,14 +83,27 @@ FullLikeOperation::ProgramFactory::cached_program_t FullLikeOperation::ProgramFa
         }
     }
 
-    std::vector<uint32_t> writer_compile_time_args = {(uint32_t)cb_fill_value_id, TILE_HW, single_tile_size};
-    tt::tt_metal::TensorAccessorArgs(output.buffer()).append_to(writer_compile_time_args);
+    std::vector<uint32_t> writer_ct_args = {(uint32_t)cb_fill_value_id, TILE_HW, single_tile_size};
+    TensorAccessorArgs(output.buffer()).append_to(writer_ct_args);
 
-    auto writer_id = CreateKernel(
-        program,
-        "ttnn/cpp/ttnn/operations/full/device/kernels/writer_full.cpp",
-        all_cores,
-        tt::tt_metal::WriterDataMovementConfig(writer_compile_time_args, writer_defines));
+    ProgramDescriptor desc;
+
+    desc.cbs.push_back(CBDescriptor{
+        .total_size = single_tile_size,
+        .core_ranges = all_cores,
+        .format_descriptors = {{CBFormatDescriptor{
+            .buffer_index = cb_fill_value_id,
+            .data_format = data_format,
+            .page_size = single_tile_size,
+        }}},
+    });
+
+    KernelDescriptor writer;
+    writer.kernel_source = "ttnn/cpp/ttnn/operations/full/device/kernels/writer_full.cpp";
+    writer.core_ranges = all_cores;
+    writer.compile_time_args = writer_ct_args;
+    writer.defines = writer_defines;
+    writer.config = WriterConfigDescriptor{};
 
     uint32_t tiles_offset = 0;
     for (uint32_t i = 0; i < num_cores; i++) {
@@ -114,32 +117,12 @@ FullLikeOperation::ProgramFactory::cached_program_t FullLikeOperation::ProgramFa
         } else {
             TT_ASSERT(false, "Core not in specified core ranges");
         }
-        SetRuntimeArgs(program, writer_id, core, {output.buffer()->address(), u.u32, num_tiles_per_core, tiles_offset});
-
+        writer.runtime_args.push_back({core, {output.buffer()->address(), u.u32, num_tiles_per_core, tiles_offset}});
         tiles_offset += num_tiles_per_core;
     }
 
-    return {std::move(program), {writer_id, num_cores, num_cores_y}};
-}
-
-void FullLikeOperation::ProgramFactory::override_runtime_arguments(
-    cached_program_t& cached_program,
-    const operation_attributes_t& /*operation_attributes*/,
-    const tensor_args_t& /*tensor_args*/,
-    tensor_return_value_t& output) {
-    auto& program = cached_program.program;
-    auto& writer_kernel_id = cached_program.shared_variables.writer_kernel_id;
-    auto& num_cores = cached_program.shared_variables.num_cores;
-    auto& num_cores_y = cached_program.shared_variables.num_cores_y;
-
-    auto output_buffer_address = output.buffer()->address();
-    for (uint32_t i = 0; i < num_cores; i++) {
-        CoreCoord core = {i / num_cores_y, i % num_cores_y};
-        {
-            auto& runtime_args = GetRuntimeArgs(program, writer_kernel_id, core);
-            runtime_args[0] = output_buffer_address;
-        }
-    }
+    desc.kernels.push_back(std::move(writer));
+    return desc;
 }
 
 }  // namespace ttnn::operations::full_like
