@@ -251,11 +251,50 @@ def parse_binding_config(yaml_path: Path, mock_cluster_rank_binding: Optional[Pa
     return config
 
 
+DEFAULT_TRACY_BASE_PORT = 8086
+
+
 @dataclass
 class TracyConfig:
     output_root: Path
     base_port: int
-    extra_args: List[str]
+    passthrough_args: List[str]
+
+
+def parse_tracy_args(raw: str) -> TracyConfig:
+    """Parse a raw tracy argument string, extracting port and output root for per-rank handling.
+
+    Recognises -t/--port and -o/--output-folder from python -m tracy's interface.
+    Those two values are consumed (they become per-rank); everything else is
+    forwarded verbatim so that new tracy options work without ttrun changes.
+    """
+    tokens = shlex.split(raw) if raw else []
+    base_port = DEFAULT_TRACY_BASE_PORT
+    output_root: Optional[Path] = None
+    passthrough: List[str] = []
+
+    i = 0
+    while i < len(tokens):
+        if tokens[i] in ("-t", "--port") and i + 1 < len(tokens):
+            base_port = int(tokens[i + 1])
+            i += 2
+        elif tokens[i] in ("-o", "--output-folder") and i + 1 < len(tokens):
+            output_root = Path(tokens[i + 1])
+            i += 2
+        else:
+            passthrough.append(tokens[i])
+            i += 1
+
+    if output_root is None:
+        output_root = Path(os.environ.get("TT_METAL_HOME", str(Path.home()))) / "generated/profiler/ttrun"
+
+    output_root = output_root.expanduser().resolve()
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    if base_port <= 0:
+        raise ValueError("Tracy base port must be a positive integer")
+
+    return TracyConfig(output_root=output_root, base_port=base_port, passthrough_args=passthrough)
 
 
 # Environment variable prefixes that should be automatically passed through to MPI processes
@@ -479,11 +518,31 @@ def build_mpi_command(
     return cmd
 
 
+def _strip_python_interpreter(program: List[str]) -> List[str]:
+    """Strip a leading python interpreter from a command list.
+
+    `python -m tracy` already runs inside Python, so an explicit interpreter
+    prefix (e.g. ``python3 script.py``) is redundant and causes tracy to try
+    to open the interpreter name as a script file.
+    """
+    if not program:
+        return program
+    first = Path(program[0]).name
+    if first in ("python", "python3") or first.startswith("python3."):
+        return program[1:]
+    if Path(program[0]).resolve() == Path(sys.executable).resolve():
+        return program[1:]
+    return program
+
+
 def wrap_program_with_tracy(
     program: List[str], binding: RankBinding, tracy_config: TracyConfig
 ) -> Tuple[List[str], Dict[str, str]]:
-    """Return the tracy-wrapped command and any extra env for a rank."""
+    """Return the tracy-wrapped command and any extra env for a rank.
 
+    Only --port and -o are injected per-rank; every other tracy flag comes
+    from the user's original --tracy string via passthrough_args.
+    """
     rank_output_dir = (tracy_config.output_root / f"rank{binding.rank}").resolve()
     rank_output_dir.mkdir(parents=True, exist_ok=True)
     port = tracy_config.base_port + binding.rank
@@ -492,19 +551,16 @@ def wrap_program_with_tracy(
         sys.executable,
         "-m",
         "tracy",
-        "-r",
-        "-v",
-        "-p",
         "--port",
         str(port),
         "-o",
         str(rank_output_dir),
     ]
 
-    if tracy_config.extra_args:
-        tracy_cmd.extend(tracy_config.extra_args)
+    if tracy_config.passthrough_args:
+        tracy_cmd.extend(tracy_config.passthrough_args)
 
-    tracy_cmd.extend(program)
+    tracy_cmd.extend(_strip_python_interpreter(program))
 
     extra_env = {
         "TT_METAL_PROFILER_DIR": str(rank_output_dir),
@@ -583,28 +639,18 @@ def print_command(cmd: List[str], prefix: str = TT_RUN_PREFIX) -> None:
     help="Network interface for MPI TCP communication (e.g., 'eth0', 'cnx1'). Uses btl_tcp_if_include instead of default exclusions.",
 )
 @click.option(
-    "--profile-with-tracy",
-    is_flag=True,
-    default=False,
-    help="Wrap each rank command with `python -m tracy` (unique port/output per rank).",
-)
-@click.option(
-    "--tracy-output-root",
-    required=False,
-    type=click.Path(path_type=Path),
-    help="Base directory for Tracy artifacts (defaults to $TT_METAL_HOME/generated/profiler/ttrun).",
-)
-@click.option(
-    "--tracy-base-port",
-    type=int,
-    default=8086,
-    show_default=True,
-    help="Base port for Tracy capture; each rank increments this by its MPI rank.",
-)
-@click.option(
-    "--tracy-extra-args",
-    callback=lambda ctx, param, value: shlex.split(value) if value else [],
-    help="Additional arguments to pass through to `python -m tracy` (quoted).",
+    "--tracy",
+    "tracy_args",
+    type=str,
+    default=None,
+    help=(
+        "Enable Tracy profiling for every rank. "
+        "Accepts the full `python -m tracy` argument string (quoted). "
+        "--port/-t and -o/--output-folder are automatically made per-rank "
+        f"(default base port {DEFAULT_TRACY_BASE_PORT}, output $TT_METAL_HOME/generated/profiler/ttrun). "
+        "All other tracy flags are forwarded verbatim. "
+        'Examples: --tracy "-r -v --no-device" or --tracy "" for defaults.'
+    ),
 )
 @click.pass_context
 def main(
@@ -618,10 +664,7 @@ def main(
     skip_executable_check: bool,
     bare: bool,
     tcp_interface: Optional[str],
-    profile_with_tracy: bool,
-    tracy_output_root: Optional[Path],
-    tracy_base_port: int,
-    tracy_extra_args: List[str],
+    tracy_args: Optional[str],
 ) -> None:
     """tt-run - MPI process launcher for TT-Metal and TTNN distributed applications
 
@@ -919,16 +962,11 @@ def main(
 
     # Build MPI command
     tracy_config = None
-    if profile_with_tracy:
-        tracy_root = tracy_output_root
-        if tracy_root is None:
-            default_root = Path(os.environ.get("TT_METAL_HOME", str(Path.home()))) / "generated/profiler/ttrun"
-            tracy_root = default_root
-        tracy_root = tracy_root.expanduser().resolve()
-        tracy_root.mkdir(parents=True, exist_ok=True)
-        if tracy_base_port <= 0:
-            raise click.ClickException("--tracy-base-port must be a positive integer")
-        tracy_config = TracyConfig(output_root=tracy_root, base_port=tracy_base_port, extra_args=tracy_extra_args)
+    if tracy_args is not None:
+        try:
+            tracy_config = parse_tracy_args(tracy_args)
+        except ValueError as e:
+            raise click.ClickException(str(e))
 
     mpi_cmd = build_mpi_command(
         config,
