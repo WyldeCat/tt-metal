@@ -515,9 +515,10 @@ def prepare_embedding_weights(
     embedding_tt = ttnn.from_torch(
         w.contiguous(),
         dtype=ttnn.bfloat16,
-        layout=ttnn.TILE_LAYOUT,
+        layout=ttnn.ROW_MAJOR_LAYOUT,
         device=None,
         memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(device),
     )
     return DeepSeekV3EmbeddingLayerWeights(embedding=embedding_tt)
 
@@ -557,32 +558,81 @@ def load_embedding_weights(path: str | Path, device) -> DeepSeekV3EmbeddingLayer
     return DeepSeekV3EmbeddingLayerWeights(embedding=embedding)
 
 
+# LM head: HF keeps full vocab (129280, 7168). Prepare shards vocab (N) across the mesh (TP=mesh size)
+# and uses the same per-device L1 WIDTH_SHARDED layout as test_lm_head_sampling (101 matmul cores).
+
+_LM_HEAD_K = 7168
+_LM_HEAD_VOCAB_SIZE = 129280
+_LM_HEAD_NUM_MATMUL_CORES = 101
+_LM_HEAD_MATMUL_CORE_GRID = ttnn.CoreRangeSet(
+    [
+        ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(9, 9)),
+        ttnn.CoreRange(ttnn.CoreCoord(10, 0), ttnn.CoreCoord(10, 0)),
+    ]
+)
+_LM_HEAD_B_TILE = ttnn.Tile([32, 32])
+_LM_HEAD_A_TILE = ttnn.Tile([1, 32])
+_LM_HEAD_N_PER_CORE = 160
+_LM_HEAD_MCAST_CORE = ttnn.CoreCoord(10, 9)
+_LM_HEAD_MCAST_CORE_GRID = ttnn.CoreRangeSet([ttnn.CoreRange(_LM_HEAD_MCAST_CORE, _LM_HEAD_MCAST_CORE)])
+
+
 def prepare_lm_head_weights(
     state_dict: dict[str, torch.Tensor],
     device,
 ) -> DeepSeekV3LMHeadWeights:
-    """Prepare LM head and final norm weights from state dict."""
-    logger.info("Preparing LM head weights...")
+    """Prepare LM head and final norm weights from state dict.
+
+    device must be the mesh device (e.g. 4x2 submesh). The LM head weight matrix is sharded
+    along the vocabulary dimension (TP = mesh size). Per-device layout matches the LM head
+    sampling op: WIDTH_SHARDED in L1 across 101 matmul cores with shard shape (7168, N_per_core).
+    """
     # lm_head.weight: HF (vocab_size, hidden_size) = (129280, 7168) -> (7168, 129280) for matmul
     lm_w = state_dict["lm_head.weight"]
-    assert lm_w.shape == (129280, 7168), f"Expected lm_head shape (129280, 7168), got {lm_w.shape}"
+    assert lm_w.shape == (
+        _LM_HEAD_VOCAB_SIZE,
+        _LM_HEAD_K,
+    ), f"Expected lm_head shape ({_LM_HEAD_VOCAB_SIZE}, {_LM_HEAD_K}), got {lm_w.shape}"
+
+    lm_head_shard_shape = (_LM_HEAD_K, _LM_HEAD_N_PER_CORE)
+    lm_head_shard_spec = ttnn.ShardSpec(
+        _LM_HEAD_MATMUL_CORE_GRID,
+        lm_head_shard_shape,
+        ttnn.ShardOrientation.ROW_MAJOR,
+    )
+    lm_head_mem_config = ttnn.MemoryConfig(
+        ttnn.TensorMemoryLayout.WIDTH_SHARDED,
+        ttnn.BufferType.L1,
+        lm_head_shard_spec,
+    )
+    mesh_mapper = ttnn.ShardTensorToMesh(device, dim=1)
     lm_head_tt = ttnn.from_torch(
         lm_w.T.contiguous(),
-        dtype=ttnn.bfloat16,
+        dtype=ttnn.bfloat8_b,
         layout=ttnn.TILE_LAYOUT,
-        device=None,  # no device needed for LM head preprocessing
-        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        device=None,
+        memory_config=lm_head_mem_config,
+        mesh_mapper=mesh_mapper,
+        tile=_LM_HEAD_B_TILE,
     )
-    logger.info("Preparing final norm weights...")
-    # model.norm.weight: (7168,) -> (1, 7168)
+
+    # model.norm.weight: (7168,) -> (1, 7168), HEIGHT_SHARDED on the mcast core
     norm_w = state_dict["model.norm.weight"]
     assert norm_w.shape == (7168,), f"Expected final norm shape (7168,), got {norm_w.shape}"
+
+    norm_mem_config = ttnn.MemoryConfig(
+        ttnn.TensorMemoryLayout.HEIGHT_SHARDED,
+        ttnn.BufferType.L1,
+        ttnn.ShardSpec(_LM_HEAD_MCAST_CORE_GRID, (1, _LM_HEAD_K), ttnn.ShardOrientation.ROW_MAJOR),
+    )
     final_norm_tt = ttnn.from_torch(
         norm_w.unsqueeze(0).contiguous(),
         dtype=ttnn.bfloat16,
-        layout=ttnn.ROW_MAJOR_LAYOUT,
-        device=None,  # no device needed for final norm preprocessing
-        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        layout=ttnn.TILE_LAYOUT,
+        tile=_LM_HEAD_A_TILE,
+        device=None,
+        memory_config=norm_mem_config,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(device),
     )
     return DeepSeekV3LMHeadWeights(lm_head=lm_head_tt, final_norm=final_norm_tt)
 
@@ -612,7 +662,11 @@ def save_lm_head_weights(
 
 
 def load_lm_head_weights(path: str | Path, device) -> DeepSeekV3LMHeadWeights:
-    """Load LM head and final norm weights from <path>/lm_head/."""
+    """Load LM head and final norm weights from <path>/lm_head/.
+
+    device must be the mesh device (same shape as used for prepare_lm_head_weights) so the
+    loaded LM head has the same vocab-dim sharding (TP = mesh size).
+    """
     path = Path(path)
     lm_dir = path / "lm_head"
     if not lm_dir.is_dir():

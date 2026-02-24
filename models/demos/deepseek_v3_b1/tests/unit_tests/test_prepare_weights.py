@@ -902,6 +902,11 @@ def test_prepare_embedding_weights_4x2(bh_2d_mesh_device):
     weights = prepare_embedding_weights(state, submesh)
     assert isinstance(weights, DeepSeekV3EmbeddingLayerWeights)
     assert weights.embedding.shape is not None
+    assert weights.embedding.shape == (
+        129280,
+        7168,
+    ), f"Expected embedding shape (129280, 7168), got {weights.embedding.shape}"
+    _assert_on_device(weights.embedding)
 
 
 @pytest.mark.parametrize(
@@ -910,7 +915,7 @@ def test_prepare_embedding_weights_4x2(bh_2d_mesh_device):
     indirect=True,
 )
 def test_prepare_lm_head_weights_4x2(bh_2d_mesh_device):
-    """Prepare LM head and final norm weights on 4x2 mesh; verify shapes. Tensors stay on host until load_lm_head_weights."""
+    """Prepare LM head and final norm weights on 4x2 mesh; verify shapes. LM head is vocab-sharded on device (TP=8)."""
     _skip_unless_4x2_mesh(bh_2d_mesh_device)
     submesh = bh_2d_mesh_device.create_submesh(ttnn.MeshShape((4, 2)))
     state = {}
@@ -918,7 +923,9 @@ def test_prepare_lm_head_weights_4x2(bh_2d_mesh_device):
     weights = prepare_lm_head_weights(state, submesh)
     assert isinstance(weights, DeepSeekV3LMHeadWeights)
     assert weights.lm_head.shape is not None
+    assert weights.lm_head.shape == (7168, 16160), f"Expected lm_head shape (7168, 16160), got {weights.lm_head.shape}"
     assert weights.final_norm.shape is not None
+    assert weights.final_norm.shape == (1, 7168), f"Expected final_norm shape (1, 7168), got {weights.final_norm.shape}"
 
 
 @pytest.mark.parametrize(
@@ -945,7 +952,13 @@ def test_save_load_embedding_and_lm_head_weights_4x2(bh_2d_mesh_device, tmp_path
     logger.info("Saving embedding...")
     save_embedding_weights(embedding_weights, tmp_path, hf_model_name="test", hf_state_dict_name="test.safetensors")
     logger.info("Saving LM head weights...")
-    save_lm_head_weights(lm_head_weights, tmp_path, hf_model_name="test", hf_state_dict_name="test.safetensors")
+    save_lm_head_weights(
+        lm_head_weights,
+        tmp_path,
+        hf_model_name="test",
+        hf_state_dict_name="test.safetensors",
+        device_mesh_shape=(4, 2),
+    )
     ttnn.deallocate(embedding_weights.embedding, force=True)
     ttnn.deallocate(lm_head_weights.lm_head, force=True)
     ttnn.deallocate(lm_head_weights.final_norm, force=True)
