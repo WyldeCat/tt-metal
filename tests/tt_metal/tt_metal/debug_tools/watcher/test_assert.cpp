@@ -201,9 +201,9 @@ static void RunTest(
         std::string pattern = regex_escape(expected);
         const std::string placeholder = "on line 0";
         size_t pos = pattern.find(placeholder);
-        if (pos != std::string::npos) {
-            pattern.replace(pos, placeholder.length(), "on line \\d+");
-        }
+        ASSERT_NE(pos, std::string::npos)
+            << "Expected placeholder '" << placeholder << "' not found in escaped pattern: " << pattern;
+        pattern.replace(pos, placeholder.length(), "on line \\d+");
         EXPECT_TRUE(std::regex_match(exception, std::regex(pattern)))
             << "Expected pattern: " << pattern << "\nActual: " << exception;
     } else {
