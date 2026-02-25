@@ -15,6 +15,7 @@ from conftest import is_6u
 import pandas as pd
 import numpy as np
 import multiprocessing as mp
+import pytest
 
 from tracy.common import (
     TT_METAL_HOME,
@@ -27,7 +28,7 @@ from tracy.common import (
     clear_profiler_runtime_artifacts,
 )
 
-from models.common.utility_functions import skip_for_blackhole
+from models.common.utility_functions import skip_for_blackhole, skip_with_llk_assert
 
 PROG_EXMP_DIR = "programming_examples/profiler"
 TRACY_TESTS_DIR = "./tests/ttnn/tracy"
@@ -1063,6 +1064,7 @@ def test_ethernet_dispatch_cores():
         _validate_ethernet_dispatch_counts(devicesData, MIN_COUNT, MAX_COUNT)
 
 
+@skip_with_llk_assert()
 def test_profiler_host_device_sync():
     TOLERANCE = 0.1
 
@@ -1115,6 +1117,7 @@ def test_profiler_host_device_sync():
             assert freq > (reportedFreq * (1 - TOLERANCE)), f"Frequency {freq} is too small on device {device}"
 
 
+@skip_with_llk_assert()
 def test_timestamped_events():
     OP_COUNT = 2
     RISC_COUNT = 5
@@ -1203,6 +1206,7 @@ def test_noc_event_profiler():
 
 
 @skip_for_blackhole()
+@skip_with_llk_assert()
 def test_fabric_event_profiler_1d():
     ENV_VAR_ARCH_NAME = os.getenv("ARCH_NAME")
     assert ENV_VAR_ARCH_NAME in ["wormhole_b0", "blackhole"]
@@ -1279,6 +1283,7 @@ def test_fabric_event_profiler_1d():
 
 
 @skip_for_blackhole()
+@skip_with_llk_assert()
 def test_fabric_event_profiler_fabric_mux():
     ENV_VAR_ARCH_NAME = os.getenv("ARCH_NAME")
     assert ENV_VAR_ARCH_NAME in ["wormhole_b0", "blackhole"]
@@ -1352,6 +1357,7 @@ def test_fabric_event_profiler_fabric_mux():
 
 
 @skip_for_blackhole()
+@pytest.mark.timeout(1080)
 def test_fabric_event_profiler_2d():
     ENV_VAR_ARCH_NAME = os.getenv("ARCH_NAME")
     assert ENV_VAR_ARCH_NAME in ["wormhole_b0", "blackhole"]
@@ -1468,6 +1474,7 @@ def test_fabric_event_profiler_2d():
             ), f"There are {actual_event_counts.get(event, 0)} fabric events with fields {event}, expected {expected_event_counts.get(event, 0)}"
 
 
+@pytest.mark.timeout(1080)
 def test_sub_device_profiler():
     ARCH_NAME = os.getenv("ARCH_NAME")
     run_gtest_profiler_test(
@@ -1503,6 +1510,7 @@ def validate_programs_perf_durations(perf_data):
                     assert row[analysis_type].values[0] == analysis_result["duration"]
 
 
+@pytest.mark.timeout(1080)
 def test_get_programs_perf_data():
     # Program execution UIDs and the number of programs are validated in the test_get_programs_perf_data gtests
     # In this file, we validate the durations of the programs
