@@ -126,7 +126,7 @@ struct KVCacheUpdate {
                 // 2. Wait for new cache data and update into kv_cache_intermed_cb
                 cb_wait_front(new_cache_cb, 1);
 
-                uint32_t write_addr = get_read_ptr(kv_cache_intermed_cb) + offset_in_page * num_bytes_per_core;
+                uint32_t write_addr = get_write_ptr(kv_cache_intermed_cb) + offset_in_page * num_bytes_per_core;
                 uint32_t new_cache_addr = get_read_ptr(new_cache_cb);
                 // Local copy data from new cache to intermed, 1x512 for nope, 1x64 for rope (1x32 per core)
                 {
@@ -179,11 +179,12 @@ struct KVCacheUpdate {
                 pack_untilize_init<block_ct_dim, full_ct_dim>(kv_cache_input_cb, kv_cache_intermed_cb);
                 pack_untilize_block<block_ct_dim, full_ct_dim>(kv_cache_input_cb, 1, kv_cache_intermed_cb, 0);
                 cb_pop_front(kv_cache_input_cb, block_ct_dim);  // consume first 8 so second block reads tiles 8-15
-                pack_untilize_block<block_ct_dim, full_ct_dim>(kv_cache_input_cb, 1, kv_cache_intermed_cb, 1);
-                pack_untilize_uninit(kv_cache_intermed_cb);
-
+                if constexpr (kv_cache_num_tiles > block_ct_dim) {
+                    pack_untilize_block<block_ct_dim, full_ct_dim>(kv_cache_input_cb, 1, kv_cache_intermed_cb, 1);
+                    cb_pop_front(kv_cache_input_cb, kv_cache_num_tiles - block_ct_dim);  // pop remaining 8
+                }
                 cb_push_back(kv_cache_intermed_cb, kv_cache_num_tiles);
-                cb_pop_front(kv_cache_input_cb, kv_cache_num_tiles - block_ct_dim);  // pop remaining 8
+                pack_untilize_uninit(kv_cache_intermed_cb);
 
                 cb_wait_front(kv_cache_intermed_cb, kv_cache_num_tiles + 1);
                 cb_reserve_back(kv_cache_output_cb, kv_cache_num_tiles);
@@ -194,7 +195,7 @@ struct KVCacheUpdate {
                 tilize_block(kv_cache_intermed_cb, kv_cache_num_tiles, kv_cache_output_cb);
                 tilize_uninit(kv_cache_intermed_cb, kv_cache_output_cb);
                 cb_push_back(kv_cache_output_cb, kv_cache_num_tiles);
-                cb_pop_front(kv_cache_intermed_cb, kv_cache_num_tiles);
+                cb_pop_front(kv_cache_intermed_cb, kv_cache_num_tiles + 1);
             }
 #endif
         }
