@@ -15,7 +15,6 @@ from conftest import is_6u
 import pandas as pd
 import numpy as np
 import multiprocessing as mp
-import pytest
 
 from tracy.common import (
     TT_METAL_HOME,
