@@ -1356,7 +1356,6 @@ def test_fabric_event_profiler_fabric_mux():
 
 
 @skip_for_blackhole()
-@skip_with_llk_assert()
 def test_fabric_event_profiler_2d():
     ENV_VAR_ARCH_NAME = os.getenv("ARCH_NAME")
     assert ENV_VAR_ARCH_NAME in ["wormhole_b0", "blackhole"]
@@ -1473,7 +1472,6 @@ def test_fabric_event_profiler_2d():
             ), f"There are {actual_event_counts.get(event, 0)} fabric events with fields {event}, expected {expected_event_counts.get(event, 0)}"
 
 
-@skip_with_llk_assert()
 def test_sub_device_profiler():
     ARCH_NAME = os.getenv("ARCH_NAME")
     run_gtest_profiler_test(
@@ -1509,7 +1507,6 @@ def validate_programs_perf_durations(perf_data):
                     assert row[analysis_type].values[0] == analysis_result["duration"]
 
 
-@skip_with_llk_assert()
 def test_get_programs_perf_data():
     # Program execution UIDs and the number of programs are validated in the test_get_programs_perf_data gtests
     # In this file, we validate the durations of the programs
