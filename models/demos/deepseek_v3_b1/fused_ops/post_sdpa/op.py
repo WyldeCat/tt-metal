@@ -9,12 +9,12 @@ This implements Matmul1 + Gather1 + Mcast + Matmul2 + Gather2 + CCL All-Reduce a
 - Matmul1: [1, 512] x [512, 128] -> [1, 128] distributed across 64 cores (8x8 grid)
 - Gather1: Collect results from all 64 cores to [1, 8192] on gather core (12, 9)
 - Mcast: Broadcast [1, 8192] to 130 cores (13x10 grid, rectangular for efficient mcast)
-- Matmul2: [1, 8192] x [8192, 64] -> [1, 64] on 112 active cores (rows 0-8 full 12 + row 9 cols 0-3)
+- Matmul2: [1, 8192] x [8192, 64] -> [1, 64] on 112 active cores (o_proj grid: 12x8 + 8x2)
 - Gather2: Collect results from all 112 active cores to [1, 7168] on gather core (12, 9)
 - CCL All-Reduce: Exchange [1, 7168] between devices and reduce (local + remote + residual)
 
 The 13x10 mcast grid contains 130 cores, but only 112 are active for matmul2.
-The 8 inactive cores (row 9 cols 4-11) receive mcast data but skip matmul via is_matmul2_core=false.
+The 18 inactive cores receive mcast data but skip matmul via is_matmul2_core=false.
 
 CCL All-Reduce uses:
 - CCL Receiver core = Gather core (12, 9) - already has local data after Gather2
@@ -40,7 +40,9 @@ CB Layout:
 import torch
 
 import ttnn
+from models.demos.deepseek_v3_b1.blitz_decode_weights import O_PROJ_GATE_MM_RMSNORM_GAMMA_SingleDeviceOverlapSpec
 from models.demos.deepseek_v3_b1.unified_kernel_descriptor import (
+    PerCoreCompileTimeDescriptor,
     UnifiedCompileTimeCoreDescriptor,
     UnifiedKernelDescriptor,
 )
@@ -244,23 +246,23 @@ class PostSDPA:
         mcast_core_grid = ttnn.CoreRangeSet([mcast_grid])
         num_mcast_cores = mcast_grid.grid_size().x * mcast_grid.grid_size().y  # 130
 
-        # Active Matmul2 cores: 112 cores (rows 0-8 full 12 cols + row 9 cols 0-3)
-        matmul2_grid_main = ttnn.CoreRange(
-            ttnn.CoreCoord(0, 0),
-            ttnn.CoreCoord(11, 8),  # 12 columns x 9 rows = 108 cores
-        )
-        matmul2_grid_extra = ttnn.CoreRange(
-            ttnn.CoreCoord(0, 9),
-            ttnn.CoreCoord(3, 9),  # 4 columns x 1 row = 4 cores
-        )
-        matmul2_active_core_grid = ttnn.CoreRangeSet([matmul2_grid_main, matmul2_grid_extra])
-        num_matmul2_cores = 112  # 108 + 4 active cores
+        # Active Matmul2 cores: 112 cores from o_proj overlap spec
+        o_proj_spec = O_PROJ_GATE_MM_RMSNORM_GAMMA_SingleDeviceOverlapSpec()
+        matmul2_active_core_grid = o_proj_spec.o_proj_core_range_set
+        num_matmul2_cores = matmul2_active_core_grid.num_cores()  # 112
 
-        # Gather2 sender grid bounds (for offset calculation, use bounding box)
-        MATMUL2_GRID_START_X = 0
-        MATMUL2_GRID_START_Y = 0
-        MATMUL2_GRID_END_X = 11  # Same as mcast grid for offset calculation
-        MATMUL2_GRID_END_Y = 9
+        # Per-core gather2 sender index: contiguous 0..111 in row-major order.
+        # Row-major (y then x) matches WIDTH_SHARDED shard placement order.
+        matmul2_cores = ttnn.corerange_to_cores(matmul2_active_core_grid, row_wise=True)
+        gather2_sender_idx_per_core = [(core, idx) for idx, core in enumerate(matmul2_cores)]
+
+        # Bounding box for gather2 grid args (unused with per-core sender_idx,
+        # but the kernel struct still reads these fields)
+        matmul2_bb = matmul2_active_core_grid.bounding_box()
+        MATMUL2_GRID_START_X = matmul2_bb.start.x
+        MATMUL2_GRID_START_Y = matmul2_bb.start.y
+        MATMUL2_GRID_END_X = matmul2_bb.end.x
+        MATMUL2_GRID_END_Y = matmul2_bb.end.y
 
         # Full grid (union of all cores for semaphore allocation)
         full_grid = matmul1_core_grid.merge(gather_core_grid).merge(mcast_core_grid).merge(ccl_sender_core_grid)
@@ -1287,6 +1289,13 @@ class PostSDPA:
                     ),
                     defines=kernel_defines,
                     unified_compile_time_core_descriptors=unified_compile_time_core_descriptors,
+                    per_core_compile_time_descriptors=[
+                        PerCoreCompileTimeDescriptor(
+                            named_compile_time_arg="gather2_sender_idx",
+                            core_values=gather2_sender_idx_per_core,
+                            other_value=0,
+                        ),
+                    ],
                 )
 
                 # Get kernel descriptors

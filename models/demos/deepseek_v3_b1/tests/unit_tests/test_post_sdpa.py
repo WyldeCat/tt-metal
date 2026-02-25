@@ -21,7 +21,7 @@ Post-SDPA phases:
 - TP All-Reduce: Exchange [1, 7168] between devices, reduce (local + remote + residual)
 
 The mcast grid (13x10=130 cores) includes 18 inactive cores that receive mcast data
-but skip matmul2 via is_matmul2_core=false (col 12 rows 0-8 + row 9 cols 4-11).
+but skip matmul2 via is_matmul2_core=false.
 
 Core Layout:
 - SDPA Workers: (2,8)-(5,8), (2,9)-(5,9) = 8 cores
@@ -39,6 +39,10 @@ from loguru import logger
 
 import ttnn
 from models.common.utility_functions import comp_pcc
+from models.demos.deepseek_v3_b1.blitz_decode_weights import (
+    KVB12_PROJ_SingleDeviceOverlapSpec,
+    O_PROJ_GATE_MM_RMSNORM_GAMMA_SingleDeviceOverlapSpec,
+)
 from models.demos.deepseek_v3_b1.fused_ops.post_sdpa.op import PostSDPA
 from models.demos.deepseek_v3_b1.micro_ops.sdpa_reduce_to_all.op import SdpaReduceToAll
 
@@ -163,19 +167,20 @@ def test_post_sdpa(
     # ========================================================================
     # Grid configuration
     # ========================================================================
-    # Matmul1 grid: 8x8 = 64 cores
-    MATMUL1_GRID_X = 8
-    MATMUL1_GRID_Y = 8
-    num_matmul1_cores = MATMUL1_GRID_X * MATMUL1_GRID_Y  # 64
+    # Matmul1 grid from KV B1/B2 overlap spec (8x8 = 64 cores)
+    kv_b12_spec = KVB12_PROJ_SingleDeviceOverlapSpec()
+    matmul1_grid = kv_b12_spec.kv_b1_core_range_set
+    num_matmul1_cores = matmul1_grid.num_cores()  # 64
+
+    # Matmul2 grid from o_proj overlap spec (112 cores)
+    o_proj_spec = O_PROJ_GATE_MM_RMSNORM_GAMMA_SingleDeviceOverlapSpec()
+    matmul2_grid = o_proj_spec.o_proj_core_range_set
+    num_matmul2_cores = matmul2_grid.num_cores()  # 112
 
     # Mcast grid: 13x10 = 130 cores (rectangular for efficient mcast)
     MCAST_GRID_X = 13
     MCAST_GRID_Y = 10
     num_mcast_cores = MCAST_GRID_X * MCAST_GRID_Y  # 130
-
-    # Active Matmul2 cores: 112 (rows 0-8 full 12 cols + row 9 cols 0-3)
-    # Non-rectangular grid: 12*9 + 4 = 108 + 4 = 112
-    num_matmul2_cores = 112
 
     # Per-core dimensions
     n1_per_core = intermediate // num_matmul1_cores  # 8192 / 64 = 128
@@ -187,20 +192,6 @@ def test_post_sdpa(
     logger.info(f"  Matmul2: [{M}, {K2}] x [{K2}, {output_size}] on {num_matmul2_cores} active cores")
     logger.info(f"  TP All-Reduce: [{M}, {output_size}] across {num_devices} devices")
     logger.info(f"  Output: [{M}, {output_size}] (fuse_residual_add={fuse_residual_add})")
-
-    # Create core grids
-    matmul1_grid = ttnn.CoreRangeSet(
-        [ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(MATMUL1_GRID_X - 1, MATMUL1_GRID_Y - 1))]
-    )
-    # Active matmul2 cores: non-rectangular grid (112 cores)
-    # - Rows 0-8: all 12 columns = 108 cores
-    # - Row 9: columns 0-3 = 4 cores
-    matmul2_grid = ttnn.CoreRangeSet(
-        [
-            ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(11, 8)),  # 12x9 = 108 cores
-            ttnn.CoreRange(ttnn.CoreCoord(0, 9), ttnn.CoreCoord(3, 9)),  # 4x1 = 4 cores
-        ]
-    )
     gather_core = ttnn.CoreCoord(12, 9)
     gather_core_grid = ttnn.CoreRangeSet([ttnn.CoreRange(gather_core, gather_core)])
 
@@ -632,18 +623,20 @@ def test_post_sdpa_with_sdpa_phase(
     # ========================================================================
     # Grid configuration
     # ========================================================================
-    # Matmul1 grid: 8x8 = 64 cores
-    MATMUL1_GRID_X = 8
-    MATMUL1_GRID_Y = 8
-    num_matmul1_cores = MATMUL1_GRID_X * MATMUL1_GRID_Y  # 64
+    # Matmul1 grid from KV B1/B2 overlap spec (8x8 = 64 cores)
+    kv_b12_spec = KVB12_PROJ_SingleDeviceOverlapSpec()
+    matmul1_grid = kv_b12_spec.kv_b1_core_range_set
+    num_matmul1_cores = matmul1_grid.num_cores()  # 64
+
+    # Matmul2 grid from o_proj overlap spec (112 cores)
+    o_proj_spec = O_PROJ_GATE_MM_RMSNORM_GAMMA_SingleDeviceOverlapSpec()
+    matmul2_grid = o_proj_spec.o_proj_core_range_set
+    num_matmul2_cores = matmul2_grid.num_cores()  # 112
 
     # Mcast grid: 13x10 = 130 cores (rectangular for efficient mcast)
     MCAST_GRID_X = 13
     MCAST_GRID_Y = 10
     num_mcast_cores = MCAST_GRID_X * MCAST_GRID_Y  # 130
-
-    # Active Matmul2 cores: 112 (rows 0-8 full 12 cols + row 9 cols 0-3)
-    num_matmul2_cores = 112
 
     # SDPA configuration (matching original sdpa_reduce_to_all test)
     NUM_SDPA_WORKERS = 8
@@ -662,17 +655,6 @@ def test_post_sdpa_with_sdpa_phase(
     logger.info(f"  Mcast: [{M}, {intermediate}] to {num_mcast_cores} cores (13x10 grid)")
     logger.info(f"  Matmul2: [{M}, {K2}] x [{K2}, {output_size}] on {num_matmul2_cores} active cores")
     logger.info(f"  TP All-Reduce: [{M}, {output_size}] across {num_devices} devices")
-
-    # Create core grids
-    matmul1_grid = ttnn.CoreRangeSet(
-        [ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(MATMUL1_GRID_X - 1, MATMUL1_GRID_Y - 1))]
-    )
-    matmul2_grid = ttnn.CoreRangeSet(
-        [
-            ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(11, 8)),  # 12x9 = 108 cores
-            ttnn.CoreRange(ttnn.CoreCoord(0, 9), ttnn.CoreCoord(3, 9)),  # 4x1 = 4 cores
-        ]
-    )
     gather_core = ttnn.CoreCoord(12, 9)
     gather_core_grid = ttnn.CoreRangeSet([ttnn.CoreRange(gather_core, gather_core)])
 
